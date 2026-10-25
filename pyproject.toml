@@ -1,0 +1,121 @@
+[project]
+name = "linc-crucible"
+version = "0.2.0"
+description = "Quality gates for mobile apps: build, deploy, score and ship-check through linc-nerve"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = [
+    "LICENSE",
+    "NOTICE",
+]
+requires-python = ">=3.13"
+authors = [
+    { name = "LINC Innovations" },
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Testing",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "pyyaml>=6.0",
+    "httpx>=0.25.0",
+    "pydantic>=2.5.0",
+    "click>=8.1.7",
+    "rich>=13.7.0",
+    "mcp>=1.0.0",
+    "python-dateutil>=2.8.2",
+    "structlog>=25.0",
+    "linc-device-kit>=1.0",
+    "linc-cli-kit>=0.1.4",
+    "av>=14.0",
+    "imagehash>=4.3.1",
+    "Pillow>=10.0",
+    "scikit-image>=0.24",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "pytest-asyncio>=0.24",
+    "pytest-timeout>=2.3",
+    "ruff>=0.9",
+    "bandit>=1.7",
+    "mutmut>=3.5,<4",
+    "pre-commit>=4.0",
+]
+
+[project.scripts]
+crucible = "linc_crucible.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/LincForge/crucible"
+Repository = "https://github.com/LincForge/crucible"
+Changelog = "https://github.com/LincForge/crucible/blob/main/CHANGELOG.md"
+Security = "https://github.com/LincForge/crucible/blob/main/SECURITY.md"
+
+[build-system]
+requires = [
+    "setuptools>=75.0",
+]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = [
+    "src",
+]
+
+[tool.ruff]
+line-length = 99
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "I",
+    "UP",
+    "B",
+    "SIM",
+    "RUF",
+    "S101",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "S101",
+]
+"**/test_*.py" = [
+    "S101",
+]
+"**/*_test.py" = [
+    "S101",
+]
+"**/conftest.py" = [
+    "S101",
+]
+"**/testing.py" = [
+    "S101",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "linc_crucible",
+]
+
+[tool.pytest.ini_options]
+testpaths = [
+    "tests",
+]
+timeout = 30
+addopts = [
+    "-m",
+    "not integration",
+]
+markers = [
+    "integration: requires real devices and running nerve daemon (deselected by default via addopts; run with -m integration)",
+]

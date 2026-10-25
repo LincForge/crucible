@@ -1,0 +1,17 @@
+name: release
+# Trusted publishing to PyPI on a v* tag: the job holds only the OIDC id-token, no stored credential.
+on:
+  push:
+    tags: ["v*"]
+jobs:
+  pypi:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv build
+      - uses: pypa/gh-action-pypi-publish@release/v1

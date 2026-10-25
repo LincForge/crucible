@@ -1,0 +1,21 @@
+name: test
+# The whole public suite: the export has no integration tests, no linc-ops /
+# linc-test-utils tests, and no `ai` extra. There is no smoke workflow yet; running a
+# sample app repo against the published package is a later decision.
+on:
+  push: {branches: [main]}
+  pull_request:
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv python install ${{ matrix.python }}
+      - run: uv sync --all-extras --python ${{ matrix.python }}
+      - run: uv run pytest -q -x
