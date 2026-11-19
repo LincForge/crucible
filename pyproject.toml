@@ -1,6 +1,6 @@
 [project]
 name = "linc-crucible"
-version = "0.2.0"
+version = "0.3.0"
 description = "Quality gates for mobile apps: build, deploy, score and ship-check through linc-nerve"
 readme = "README.md"
 license = "Apache-2.0"
@@ -25,14 +25,14 @@ dependencies = [
     "pydantic>=2.5.0",
     "click>=8.1.7",
     "rich>=13.7.0",
-    "mcp>=1.0.0",
+    "mcp>=2.3.0,<3",
     "python-dateutil>=2.8.2",
     "structlog>=25.0",
     "linc-device-kit>=1.0",
-    "linc-cli-kit>=0.1.4",
+    "linc-cli-kit>=0.1.4,>=0.3.1",
     "av>=14.0",
     "imagehash>=4.3.1",
-    "Pillow>=10.0",
+    "Pillow>=13.0.0",
     "scikit-image>=0.24",
     "numpy>=1.26",
 ]
@@ -47,6 +47,7 @@ dev = [
     "bandit>=1.7",
     "mutmut>=3.5,<4",
     "pre-commit>=4.0",
+    "hypothesis>=6.100",
 ]
 
 [project.scripts]

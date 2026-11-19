@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import structlog
 
 from linc_crucible.core.scorer import (
     BASE_WEIGHTS,
@@ -17,7 +18,6 @@ from linc_crucible.core.scorer import (
     apk_size_to_score,
     ssim_to_score,
 )
-from tests.test_store_names import ascii_id
 
 
 @pytest.fixture
@@ -1354,9 +1354,7 @@ def _assert_refused(exc: BaseException | None) -> None:
 
 
 class TestScoreStoreContainment:
-    @pytest.mark.parametrize(
-        "project", ["../../escaped", "ABS", "a b", "", "a\x00b"], ids=ascii_id
-    )
+    @pytest.mark.parametrize("project", ["../../escaped", "ABS", "a b", "", "a\x00b"])
     def test_contract_save_hostile_project_writes_nothing(
         self, tmp_path: Path, project: str
     ) -> None:
@@ -1398,3 +1396,615 @@ class TestScoreStoreContainment:
         path = scorer.save(score)
         assert path.parent == tmp_path / "scores" / "My.App_2-x"
         assert path.name == score.timestamp.replace(":", "-") + ".json"
+
+
+class TestScoreStoreFallbackAndTypeChecksContract:
+    """[contract] Corrupt/list-shaped score files fall back and are counted (R4 finding 10)."""
+
+    def test_contract_corrupt_newest_falls_back_and_list_history_safe(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """[contract] A store with a corrupt newest file and three valid older files ->
+        crucible score reports the newest valid one; a list-shaped file does not crash
+        history=true."""
+        from click.testing import CliRunner
+
+        import linc_crucible.server_context as server_ctx
+        from linc_crucible.assay_tools import crucible_score
+        from linc_crucible.cli import cli
+
+        store = tmp_path / "scores"
+        scorer = QualityScorer(scores_dir=store)
+        for ts, pass_rate in (
+            ("2026-03-01T00:00:00Z", 0.6),
+            ("2026-03-02T00:00:00Z", 0.8),
+            ("2026-03-03T00:00:00Z", 1.0),
+        ):
+            s = scorer.compute("DemoProj", test_pass_rate=pass_rate, lint_issues=0)
+            s.timestamp = ts
+            scorer.save(s)
+
+        proj_dir = store / "DemoProj"
+        newest_corrupt = proj_dir / "2026-03-04T00-00-00Z.json"
+        newest_corrupt.write_text("{corrupt json", encoding="utf-8")
+
+        monkeypatch.setattr(server_ctx, "_initialized", True)
+        monkeypatch.setattr(server_ctx, "_scorer", scorer)
+
+        with structlog.testing.capture_logs():
+            runner = CliRunner()
+            res = runner.invoke(cli, ["score", "DemoProj"])
+            assert res.exit_code == 0, res.output
+            payload = json.loads(res.stdout)
+            assert payload["timestamp"] == "2026-03-03T00:00:00Z"
+            assert payload["composite"] == 100.0
+            assert payload["score"] == 100.0
+            assert payload["skipped_files"] == ["2026-03-04T00-00-00Z.json"]
+            assert payload["skipped_count"] == 1
+
+            # Now replace the newest corrupt file with a list-shaped JSON file and verify
+            # both latest and history=true skip & report/count it without AttributeError.
+            newest_corrupt.write_text("[1, 2, 3]", encoding="utf-8")
+
+            latest_res = runner.invoke(cli, ["score", "DemoProj"])
+            assert latest_res.exit_code == 0, latest_res.output
+            latest_payload = json.loads(latest_res.stdout)
+            assert latest_payload["timestamp"] == "2026-03-03T00:00:00Z"
+            assert latest_payload["skipped_files"] == ["2026-03-04T00-00-00Z.json"]
+
+            history_dict = crucible_score(project="DemoProj", history=True, limit=10)
+            assert history_dict["count"] == 3
+            assert len(history_dict["scores"]) == 3
+            assert [s["timestamp"] for s in history_dict["scores"]] == [
+                "2026-03-03T00:00:00Z",
+                "2026-03-02T00:00:00Z",
+                "2026-03-01T00:00:00Z",
+            ]
+            assert history_dict["skipped_count"] == 1
+            assert history_dict["skipped_files"] == ["2026-03-04T00-00-00Z.json"]
+
+            history_cli = runner.invoke(cli, ["score", "DemoProj", "--history"])
+            assert history_cli.exit_code == 0, history_cli.output
+            history_payload = json.loads(history_cli.stdout)
+            assert history_payload["count"] == 3
+            assert history_payload["skipped_count"] == 1
+            assert history_payload["skipped_files"] == ["2026-03-04T00-00-00Z.json"]
+
+            # Human mode also reports skipped files literally without Rich markup crash
+            (proj_dir / "2026-03-03T12[00]Z.json").write_text("[9]", encoding="utf-8")
+            human_latest = runner.invoke(cli, ["--human", "score", "DemoProj"])
+            assert human_latest.exit_code == 0
+            expected_skip_line = (
+                "Skipped 2 corrupt score file(s): "
+                "2026-03-04T00-00-00Z.json, 2026-03-03T12[00]Z.json"
+            )
+            assert expected_skip_line in human_latest.stdout
+
+            human_history = runner.invoke(cli, ["--human", "score", "DemoProj", "--history"])
+            assert human_history.exit_code == 0
+            assert expected_skip_line in human_history.stdout
+
+    def test_subprocess_cli_score_keeps_corrupt_warning_off_stdout(self, tmp_path: Path) -> None:
+        """[contract] Real CLI subprocess keeps score_file_read_failed off stdout."""
+        import os
+        import subprocess
+        import sys
+
+        store = tmp_path / "scores"
+        scorer = QualityScorer(scores_dir=store)
+        s = scorer.compute("SubProj", test_pass_rate=1.0, lint_issues=0)
+        s.timestamp = "2026-03-01T00:00:00Z"
+        scorer.save(s)
+        (store / "SubProj" / "2026-03-02T00-00-00Z.json").write_text("{corrupt", encoding="utf-8")
+
+        env = {
+            **os.environ,
+            "CRUCIBLE_SCORES_DIR": str(store),
+            "LINC_HOME": str(tmp_path / "linc_home"),
+        }
+        proc = subprocess.run(
+            [sys.executable, "-m", "linc_crucible.cli", "score", "SubProj"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+            check=False,
+        )
+        assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        payload = json.loads(proc.stdout)
+        assert payload["timestamp"] == "2026-03-01T00:00:00Z"
+        assert payload["skipped_files"] == ["2026-03-02T00-00-00Z.json"]
+
+    def test_load_history_respects_limit_across_corrupt_files_and_zero_limit(
+        self, scorer: QualityScorer
+    ) -> None:
+        for ts, pr in (
+            ("2026-03-01T00:00:00Z", 0.5),
+            ("2026-03-02T00:00:00Z", 0.8),
+            ("2026-03-04T00:00:00Z", 1.0),
+        ):
+            s = scorer.compute("Proj", test_pass_rate=pr, lint_issues=0)
+            s.timestamp = ts
+            scorer.save(s)
+        proj_dir = scorer.scores_dir / "Proj"
+        (proj_dir / "2026-03-03T00-00-00Z.json").write_text('["bad"]', encoding="utf-8")
+
+        assert scorer.load_history("Proj", limit=0) == []
+        assert scorer.last_skipped_files == []
+
+        # With limit=2, skips the corrupt 03-03 file and still returns 2 valid scores.
+        history = scorer.load_history("Proj", limit=2)
+        assert [s.timestamp for s in history] == ["2026-03-04T00:00:00Z", "2026-03-02T00:00:00Z"]
+        assert scorer.last_skipped_files == ["2026-03-03T00-00-00Z.json"]
+
+    def test_all_corrupt_files_reports_not_found_with_skipped_metadata(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from click.testing import CliRunner
+
+        import linc_crucible.server_context as server_ctx
+        from linc_crucible.assay_tools import crucible_score
+        from linc_crucible.cli import cli
+
+        store = tmp_path / "scores"
+        proj_dir = store / "AllBad"
+        proj_dir.mkdir(parents=True)
+        (proj_dir / "2026-03-01T00-00-00Z.json").write_text("[1]", encoding="utf-8")
+        (proj_dir / "2026-03-02T00-00-00Z.json").write_text("{bad", encoding="utf-8")
+
+        scorer = QualityScorer(scores_dir=store)
+        monkeypatch.setattr(server_ctx, "_initialized", True)
+        monkeypatch.setattr(server_ctx, "_scorer", scorer)
+
+        with structlog.testing.capture_logs():
+            latest_err = crucible_score(project="AllBad", history=False)
+            assert latest_err["error_category"] == "not_found"
+            assert latest_err["skipped_count"] == 2
+            assert latest_err["skipped_files"] == [
+                "2026-03-02T00-00-00Z.json",
+                "2026-03-01T00-00-00Z.json",
+            ]
+
+            hist_err = crucible_score(project="AllBad", history=True)
+            assert hist_err["count"] == 0
+            assert hist_err["empty"] is True
+            assert hist_err["skipped_count"] == 2
+
+            human_empty_hist = CliRunner().invoke(cli, ["--human", "score", "AllBad", "--history"])
+            assert human_empty_hist.exit_code == 0
+            assert "Skipped 2 corrupt score file(s):" in human_empty_hist.stdout
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            "[1, 2, 3]",
+            '"a string"',
+            "42",
+            "null",
+            '{"project": 123}',
+            '{"timestamp": []}',
+            '{"mode": false}',
+            '{"composite": "95"}',
+            '{"composite": true}',
+            '{"composite": NaN}',
+            '{"ship_gate": "yes"}',
+            '{"commit_sha": 99}',
+            '{"schema_version": "2"}',
+            '{"schema_version": true}',
+            '{"attempted_unmeasured": "tests"}',
+            '{"attempted_unmeasured": [1]}',
+            '{"dimensions": "bad"}',
+            '{"dimensions": ["not-a-dict"]}',
+            '{"dimensions": [{"name": 5}]}',
+            '{"dimensions": [{"name": "t", "score": true}]}',
+            '{"dimensions": [{"name": "t", "weight": "0.5"}]}',
+            '{"dimensions": [{"name": "t", "raw_value": Infinity}]}',
+        ],
+    )
+    def test_load_score_rejects_malformed_json_shapes_and_types(
+        self, scorer: QualityScorer, tmp_path: Path, payload: str
+    ) -> None:
+        bad = tmp_path / "bad.json"
+        bad.write_text(payload, encoding="utf-8")
+        assert scorer._load_score(bad) is None
+
+    def test_load_score_rejects_symlink_oversized_and_bad_utf8(
+        self, scorer: QualityScorer, tmp_path: Path
+    ) -> None:
+        from linc_crucible.core.scorer import _MAX_SCORE_FILE_BYTES
+
+        target = tmp_path / "real.json"
+        target.write_text('{"project": "P"}', encoding="utf-8")
+        link = tmp_path / "link.json"
+        link.symlink_to(target)
+        with structlog.testing.capture_logs() as cap_logs:
+            assert scorer._load_score(link) is None
+        assert any(
+            e.get("event") == "score_file_symlink_skipped" and str(link) in e.get("path", "")
+            for e in cap_logs
+        )
+
+        bad_utf8 = tmp_path / "bad_utf8.json"
+        bad_utf8.write_bytes(b"\xff\xfe\x00\x00")
+        with structlog.testing.capture_logs() as cap_logs:
+            assert scorer._load_score(bad_utf8) is None
+        assert any(e.get("event") == "score_file_read_failed" for e in cap_logs)
+
+        at_cap = tmp_path / "at_cap.json"
+        at_cap_prefix = b'{"project":"P"}'
+        at_cap.write_bytes(
+            at_cap_prefix[:-1] + b" " * (_MAX_SCORE_FILE_BYTES - len(at_cap_prefix)) + b"}"
+        )
+        assert scorer._load_score(at_cap) is not None
+
+        oversized = tmp_path / "huge.json"
+        oversized.write_bytes(
+            at_cap_prefix[:-1] + b" " * (_MAX_SCORE_FILE_BYTES - len(at_cap_prefix) + 1) + b"}"
+        )
+        assert scorer._load_score(oversized) is None
+
+        with structlog.testing.capture_logs() as cap_logs:
+            list_file = tmp_path / "list.json"
+            list_file.write_text("[1]", encoding="utf-8")
+            assert scorer._load_score(list_file) is None
+            bad_schema = tmp_path / "bad_schema.json"
+            bad_schema.write_text('{"composite": "bad"}', encoding="utf-8")
+            assert scorer._load_score(bad_schema) is None
+        assert any(
+            e.get("event") == "score_file_not_object" and e.get("type") == "list" for e in cap_logs
+        )
+        assert any(e.get("event") == "score_file_invalid_schema" for e in cap_logs)
+
+        minimal = tmp_path / "minimal.json"
+        minimal.write_text('{"dimensions": [{}]}', encoding="utf-8")
+        loaded_min = scorer._load_score(minimal)
+        assert loaded_min is not None
+        assert loaded_min.project == ""
+        assert loaded_min.timestamp == ""
+        assert loaded_min.mode == "quick"
+        assert loaded_min.composite == 0.0
+        assert loaded_min.ship_gate is False
+        assert loaded_min.commit_sha is None
+        assert loaded_min.attempted_unmeasured == []
+        assert loaded_min.stale is True
+        assert len(loaded_min.dimensions) == 1
+        d0 = loaded_min.dimensions[0]
+        assert (d0.name, d0.raw_value, d0.score, d0.weight, d0.weighted_score) == (
+            "",
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        )
+
+        valid_ints = tmp_path / "valid_ints.json"
+        valid_ints.write_text(
+            json.dumps(
+                {
+                    "project": "P",
+                    "timestamp": "T",
+                    "mode": "quick",
+                    "composite": 90,
+                    "ship_gate": True,
+                    "commit_sha": "deadbeef",
+                    "schema_version": 2,
+                    "attempted_unmeasured": [],
+                    "dimensions": [
+                        {
+                            "name": "tests",
+                            "raw_value": 1,
+                            "score": 100,
+                            "weight": 1,
+                            "weighted_score": 100,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        loaded = scorer._load_score(valid_ints)
+        assert loaded is not None
+        assert loaded.composite == 90.0
+        assert loaded.commit_sha == "deadbeef"
+        assert loaded.stale is False
+        assert loaded.dimensions[0].score == 100.0
+
+
+def test_contract_load_latest_stops_at_the_newest_readable_score(scorer: QualityScorer) -> None:
+    """[contract] load_latest returns the newest readable score and reports only the
+    corrupt files newer than it: it does not scan past it into older files."""
+    project_dir = scorer._scores_dir / "Seq"
+    project_dir.mkdir(parents=True)
+    good = {
+        "project": "Seq",
+        "timestamp": "2026-01-03T00:00:00Z",
+        "mode": "quick",
+        "composite": 91.0,
+        "ship_gate": True,
+        "commit_sha": "abc123",
+        "schema_version": 2,
+        "dimensions": [
+            {
+                "name": "tests",
+                "raw_value": 0.9,
+                "score": 90.0,
+                "weight": 1.0,
+                "weighted_score": 90.5,
+            }
+        ],
+    }
+    (project_dir / "2026-01-03T00-00-00Z.json").write_text(json.dumps(good))
+    (project_dir / "2026-01-02T00-00-00Z.json").write_text("{corrupt")
+    (project_dir / "2026-01-01T00-00-00Z.json").write_text(json.dumps({**good, "composite": 10.0}))
+
+    latest = scorer.load_latest("Seq")
+    assert latest is not None
+    assert latest.composite == 91.0
+    assert latest.skipped_files == []
+    assert latest.commit_sha == "abc123"
+    assert latest.dimensions[0].weighted_score == 90.5
+
+
+def test_contract_invalid_score_file_warning_names_the_file(scorer: QualityScorer) -> None:
+    """[contract] a score file that is not a JSON object is skipped with a warning that
+    names that file, so the operator can find it."""
+    import structlog.testing
+
+    project_dir = scorer._scores_dir / "Bad"
+    project_dir.mkdir(parents=True)
+    bad = project_dir / "2026-01-01T00-00-00Z.json"
+    bad.write_text("[1, 2]")
+    with structlog.testing.capture_logs() as logs:
+        assert scorer.load_latest("Bad") is None
+    hits = [e for e in logs if e.get("event") == "score_file_not_object"]
+    assert hits and hits[0]["path"] == str(bad)
+    assert hits[0]["type"] == "list"
+
+
+def test_contract_save_interrupted_after_temp_write_preserves_previous_score(
+    scorer: QualityScorer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[contract] a save interrupted after the temp write (monkeypatch os.replace to raise)
+    leaves the previous newest score intact and no partial final file."""
+    import os
+    import stat
+
+    s1 = scorer.compute("AtomicProj", test_pass_rate=0.95, lint_issues=0)
+    s1.timestamp = "2026-03-01T00:00:00Z"
+    p1 = scorer.save(s1)
+    assert stat.S_IMODE(p1.stat().st_mode) == 0o600
+    original_bytes = p1.read_bytes()
+
+    s2 = scorer.compute("AtomicProj", test_pass_rate=0.20, lint_issues=10)
+    s2.timestamp = "2026-03-02T00:00:00Z"
+    p2_expected = p1.parent / "2026-03-02T00-00-00Z.json"
+
+    fsync_calls: list[int] = []
+    real_fsync = os.fsync
+
+    def _spy_fsync(fd: int) -> None:
+        fsync_calls.append(fd)
+        real_fsync(fd)
+
+    replace_calls: list[tuple[Path, Path]] = []
+    expected_ts = s2.timestamp
+
+    def _failing_replace(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        src_p = Path(src)
+        dst_p = Path(dst)
+        replace_calls.append((src_p, dst_p))
+        assert src_p.parent == dst_p.parent
+        assert stat.S_IMODE(src_p.stat().st_mode) == 0o600
+        assert json.loads(src_p.read_text(encoding="utf-8"))["timestamp"] == expected_ts
+        assert len(fsync_calls) >= 1
+        raise OSError("simulated crash during os.replace")
+
+    monkeypatch.setattr(os, "fsync", _spy_fsync)
+    monkeypatch.setattr(os, "replace", _failing_replace)
+
+    with pytest.raises(OSError, match="simulated crash"):
+        scorer.save(s2)
+
+    assert len(replace_calls) == 1
+    assert not p2_expected.exists()
+    assert [p.name for p in p1.parent.iterdir()] == [p1.name]
+    assert p1.read_bytes() == original_bytes
+    latest = scorer.load_latest("AtomicProj")
+    assert latest is not None
+    assert latest.timestamp == "2026-03-01T00:00:00Z"
+    assert latest.composite == s1.composite
+    assert latest.skipped_files == []
+
+    # Also interrupting an overwrite of the existing timestamp leaves p1 intact.
+    s1_overwrite = scorer.compute("AtomicProj", test_pass_rate=0.10, lint_issues=20)
+    s1_overwrite.timestamp = "2026-03-01T00:00:00Z"
+    expected_ts = s1_overwrite.timestamp
+    with pytest.raises(OSError, match="simulated crash"):
+        scorer.save(s1_overwrite)
+    assert [p.name for p in p1.parent.iterdir()] == [p1.name]
+    assert p1.read_bytes() == original_bytes
+
+
+def test_atomic_save_propagates_temp_creation_failure(
+    scorer: QualityScorer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When NamedTemporaryFile fails before creating a file, save propagates the OSError."""
+    import tempfile
+
+    s1 = scorer.compute("FailOpen", test_pass_rate=1.0, lint_issues=0)
+
+    def _fail_tmp(*_args: object, **_kwargs: object) -> object:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(tempfile, "NamedTemporaryFile", _fail_tmp)
+    with pytest.raises(OSError, match="disk full"):
+        scorer.save(s1)
+
+
+def test_load_score_refuses_directory_and_nonblock_toctou_fifo(
+    scorer: QualityScorer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Non-regular files (directories, raced FIFOs) are refused without blocking."""
+    import os
+
+    dir_entry = tmp_path / "dir.json"
+    dir_entry.mkdir()
+    assert scorer._load_score(dir_entry) is None
+
+    fifo_entry = tmp_path / "raced_fifo.json"
+    os.mkfifo(fifo_entry)
+    monkeypatch.setattr(Path, "is_file", lambda self: self == fifo_entry)
+    assert scorer._load_score(fifo_entry) is None
+
+
+def test_contract_fifo_score_file_skipped_within_2s(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[contract] a FIFO named like the newest score file: crucible score returns within 2 s
+    with that file skipped (fails/hangs on 278647a; run with a thread timeout)."""
+    import os
+    import threading
+    import time
+
+    from click.testing import CliRunner
+
+    import linc_crucible.server_context as server_ctx
+    from linc_crucible.assay_tools import crucible_score
+    from linc_crucible.cli import cli
+
+    store = tmp_path / "scores"
+    scorer = QualityScorer(scores_dir=store)
+    s1 = scorer.compute("FifoProj", test_pass_rate=0.9, lint_issues=0)
+    s1.timestamp = "2026-03-01T00:00:00Z"
+    scorer.save(s1)
+
+    fifo_name = "2026-03-02T00-00-00Z.json"
+    fifo_path = store / "FifoProj" / fifo_name
+    os.mkfifo(fifo_path)
+
+    monkeypatch.setattr(server_ctx, "_initialized", True)
+    monkeypatch.setattr(server_ctx, "_scorer", scorer)
+
+    outcome: dict[str, object] = {}
+
+    def _run_score() -> None:
+        try:
+            outcome["mcp"] = crucible_score(project="FifoProj")
+        except BaseException as exc:  # pragma: no cover - failure capture
+            outcome["exc"] = exc
+
+    t0 = time.monotonic()
+    thread = threading.Thread(target=_run_score, daemon=True)
+    thread.start()
+    thread.join(timeout=2.0)
+    elapsed = time.monotonic() - t0
+
+    assert not thread.is_alive(), "crucible_score hung on FIFO score file (>2s)"
+    assert elapsed < 2.0
+    assert "exc" not in outcome
+    mcp_res = outcome["mcp"]
+    assert isinstance(mcp_res, dict)
+    assert mcp_res["timestamp"] == "2026-03-01T00:00:00Z"
+    assert mcp_res["skipped_files"] == [fifo_name]
+
+    # Exercise the CLI `crucible score` command as well (now known not to hang in open()).
+    with structlog.testing.capture_logs():
+        cli_res = CliRunner().invoke(cli, ["score", "FifoProj"])
+    assert cli_res.exit_code == 0, cli_res.output
+    payload = json.loads(cli_res.stdout)
+    assert payload["timestamp"] == "2026-03-01T00:00:00Z"
+    assert payload["skipped_files"] == [fifo_name]
+
+
+def test_contract_skipped_filename_with_esc_printed_escaped_in_human(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[contract] a skipped filename containing ESC is printed escaped in --human."""
+    from click.testing import CliRunner
+
+    import linc_crucible.server_context as server_ctx
+    from linc_crucible.cli import cli
+
+    store = tmp_path / "scores"
+    scorer = QualityScorer(scores_dir=store)
+    s1 = scorer.compute("EscProj", test_pass_rate=1.0, lint_issues=0)
+    s1.timestamp = "2026-03-01T00:00:00Z"
+    scorer.save(s1)
+
+    esc_name = "2026-03-04T00-00-00Z\x1b[31mEVIL\x1b[0m\u202e.json"
+    (store / "EscProj" / esc_name).write_text("{corrupt", encoding="utf-8")
+
+    monkeypatch.setattr(server_ctx, "_initialized", True)
+    monkeypatch.setattr(server_ctx, "_scorer", scorer)
+
+    with structlog.testing.capture_logs():
+        runner = CliRunner()
+        res_latest = runner.invoke(cli, ["--human", "score", "EscProj"])
+        assert res_latest.exit_code == 0, res_latest.output
+        assert "\x1b" not in res_latest.stdout
+        assert "\u202e" not in res_latest.stdout
+        assert r"2026-03-04T00-00-00Z\x1b[31mEVIL\x1b[0m\u202e.json" in res_latest.stdout
+
+        res_hist = runner.invoke(cli, ["--human", "score", "EscProj", "--history"])
+        assert res_hist.exit_code == 0, res_hist.output
+        assert "\x1b" not in res_hist.stdout
+        assert "\u202e" not in res_hist.stdout
+        assert r"2026-03-04T00-00-00Z\x1b[31mEVIL\x1b[0m\u202e.json" in res_hist.stdout
+
+
+def test_contract_atomic_save_uses_hidden_tmp_name_and_indented_json(
+    scorer: QualityScorer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[contract] a save writes a hidden `.score-*.tmp` file in the same directory (never a
+    `*.json` a reader could pick up), 0600, then replaces it onto the final name; the final
+    file is two-space indented UTF-8 JSON."""
+    import os as _os
+    import stat as _stat
+
+    from linc_crucible.core import scorer as scorer_mod
+
+    seen: list[tuple[Path, Path, int]] = []
+    real_replace = _os.replace
+
+    def _spy(src: str | Path, dst: str | Path) -> None:
+        src_p = Path(src)
+        seen.append((src_p, Path(dst), _stat.S_IMODE(src_p.stat().st_mode)))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(scorer_mod.os, "replace", _spy)
+    score = scorer.compute(project="AtomicNames", test_pass_rate=1.0, lint_issues=0)
+    final = scorer.save(score)
+
+    assert len(seen) == 1
+    tmp, dst, mode = seen[0]
+    assert dst == final
+    assert tmp.parent == final.parent
+    assert tmp.name.startswith(".score-") and tmp.name.endswith(".tmp")
+    assert mode == 0o600
+    assert not tmp.exists()
+    text = final.read_text(encoding="utf-8")
+    assert text.startswith('{\n  "')
+    assert sorted(p.name for p in final.parent.iterdir()) == [final.name]
+
+
+def test_contract_reject_non_regular_score_decides_each_kind(tmp_path: Path) -> None:
+    """[contract] the store's first guard rejects a symlink and a non-regular file (FIFO,
+    directory) by itself, and accepts a regular file: it does not rely on the open()
+    flags behind it."""
+    import os as _os
+
+    from linc_crucible.core.scorer import _reject_non_regular_score
+
+    regular = tmp_path / "a.json"
+    regular.write_text("{}")
+    link = tmp_path / "b.json"
+    link.symlink_to(regular)
+    fifo = tmp_path / "c.json"
+    _os.mkfifo(fifo)
+    directory = tmp_path / "d.json"
+    directory.mkdir()
+
+    assert _reject_non_regular_score(regular) is False
+    assert _reject_non_regular_score(link) is True
+    assert _reject_non_regular_score(fifo) is True
+    assert _reject_non_regular_score(directory) is True

@@ -1,5 +1,8 @@
 import json
+import os
+import tempfile
 import time
+from pathlib import Path
 
 import structlog
 
@@ -10,7 +13,10 @@ from linc_crucible.core.deployer import (
     personal_device_error,
     resolve_policy_target,
 )
-from linc_crucible.core.tool_args import bvt_args_error
+from linc_crucible.core.nerve_client import validate_owner
+from linc_crucible.core.state_paths import ensure_private_dir
+from linc_crucible.core.store_names import validation_error
+from linc_crucible.core.tool_args import InvalidToolArg, bvt_args_error, resolve_bvt_output_dir
 from linc_crucible.server_context import _observed_tool, server
 
 logger = structlog.get_logger().bind(domain="build_pipeline")
@@ -83,14 +89,16 @@ def _personal_device_refusal(device: str, allow_personal: bool) -> str | None:
     return json.dumps({"ran": False, **personal_device_error(refusal)})
 
 
-def _reservation_refusal(device: str) -> str | None:
+def _reservation_refusal(device: str, owner: str = "") -> str | None:
     """Reservation guard — serialized precondition or None.
 
     Refuses to drive a device another nerve session is actively holding so a
     concurrent BVT run never steals the foreground mid-comparison from a device
-    another session has reserved. nerve_pool degrades gracefully: an
-    unreachable daemon here means the ledger itself couldn't be read, so the
-    check is skipped rather than treating "unreachable" as "unreserved".
+    another session has reserved. When a non-empty ``owner`` matches the
+    reservation's ``owner``, the caller holds the lease and may proceed.
+    nerve_pool degrades gracefully: an unreachable daemon here means the ledger
+    itself couldn't be read, so the check is skipped rather than treating
+    "unreachable" as "unreserved".
     """
     from .core.nerve_client import find_reservation
 
@@ -99,7 +107,7 @@ def _reservation_refusal(device: str) -> str | None:
     except ConnectionError:
         return None
     reservation = find_reservation((pool_result or {}).get("reservations", []), device)
-    if not reservation:
+    if not reservation or (owner and reservation.get("owner") == owner):
         return None
     return _bvt_precondition(
         "device-reserved",
@@ -109,10 +117,32 @@ def _reservation_refusal(device: str) -> str | None:
     )
 
 
-def _device_guard(device: str, allow_personal: bool) -> str | None:
+def _device_guard(device: str, allow_personal: bool, owner: str = "") -> str | None:
     """Personal-device policy first (a personal device is never touched — not
     even by the reservation lookup), then the reservation guard."""
-    return _personal_device_refusal(device, allow_personal) or _reservation_refusal(device)
+    return _personal_device_refusal(device, allow_personal) or _reservation_refusal(device, owner)
+
+
+def _resolve_owner(owner: object) -> object:
+    """Resolve the raw owner from the explicit argument or ``NERVE_OWNER``."""
+    if owner == "":
+        return os.environ.get("NERVE_OWNER", "")
+    return owner
+
+
+def _bvt_adapter(owner: str):
+    """Return an owner-scoped NerveAdapter when ``owner`` is set, else the singleton."""
+    if not owner:
+        return ctx._bvt_nerve_adapter
+    from .core.bvt.nerve_adapter import NerveAdapter
+
+    return NerveAdapter(nerve=ctx._nerve_client.with_owner(owner))
+
+
+def _attach_reservation_owner(result_dict: dict, owner: str) -> None:
+    """Record ``reservation_owner`` on ``result_dict`` when a lease owner is in effect."""
+    if owner:
+        result_dict["reservation_owner"] = owner
 
 
 def _bvt_precondition(reason: str, detail: str) -> str:
@@ -125,6 +155,25 @@ def _bvt_precondition(reason: str, detail: str) -> str:
         raise ValueError(f"unknown precondition reason: {reason}")
     logger.warning("crucible_bvt_precondition_failed", reason=reason, detail=detail)
     return json.dumps({"ran": False, "reason": reason, "detail": detail})
+
+
+def _prepare_bvt_output_dir(output_dir: str | None) -> Path:
+    """Resolve and create the BVT output dir, re-proving containment after mkdir."""
+    if output_dir is None:
+        return Path(tempfile.mkdtemp(prefix="crucible_bvt_"))
+    out = resolve_bvt_output_dir(output_dir)
+    try:
+        ensure_private_dir(out)
+    except OSError as exc:
+        raise InvalidToolArg(
+            "output_dir",
+            f"cannot create output directory ({type(exc).__name__})",
+            output_dir,
+        ) from exc
+    resolved = resolve_bvt_output_dir(str(out))
+    if not resolved.is_dir():
+        raise InvalidToolArg("output_dir", "must be a directory", output_dir)
+    return resolved
 
 
 @server.tool()
@@ -142,6 +191,7 @@ async def crucible_bvt(
     # literal keeps the heavy runner import lazy, inside the tool body.
     budget_s: float | None = 1800.0,
     allow_personal: bool = False,
+    owner: str = "",
 ) -> str:
     """Run BVT (Build Verification Test) suite for a project on a device.
 
@@ -173,7 +223,9 @@ async def crucible_bvt(
               example, passing `exclude_tags=["ios"]` on an Android lane).
               Untagged tests are never dropped by this filter. None = no
               exclusion (identical to today's behavior).
-        output_dir: Where to write screenshots + perf artifacts.
+        output_dir: Where to write screenshots + perf artifacts. Must stay
+                    inside the crucible state root (``$LINC_HOME/crucible``);
+                    relative paths resolve under that root.
                     Default: tempfile.mkdtemp(prefix="crucible_bvt_").
         compare_against_baseline: When True, diff each captured screenshot
                     against its latest golden (BaselineManager) and attach a
@@ -195,6 +247,10 @@ async def crucible_bvt(
         allow_personal: Permit running on a device registered
                     ``personal: true`` (and proceed when the registry is
                     unreadable). Default False.
+        owner: Optional nerve reservation lease owner (falls back to
+                    ``NERVE_OWNER`` when empty). When set, the reservation
+                    guard honours a lease held by ``owner`` and forwards
+                    ``owner`` on every nerve device tool call.
 
     Returns:
         On a run that executed: JSON-serialized BVTRunResult with shape:
@@ -238,15 +294,14 @@ async def crucible_bvt(
         raise — a raised error means crucible itself broke, not that the
         environment wasn't ready.
     """
-    import tempfile
     from dataclasses import asdict
-    from pathlib import Path
 
     from .core.bvt.runner import BVTRunner, BVTTestResult
     from .core.bvt.schema import load_bvt_dir
 
     ctx._ensure_initialized()
 
+    raw_owner = _resolve_owner(owner)
     args_error = bvt_args_error(
         project,
         device,
@@ -258,9 +313,11 @@ async def crucible_bvt(
         app_path,
         budget_s,
         allow_personal,
+        raw_owner,
     )
     if args_error:
         return args_error
+    effective_owner = validate_owner(raw_owner)
 
     start = time.monotonic()
     # Known precondition failures return {ran: false, reason} instead of
@@ -284,7 +341,7 @@ async def crucible_bvt(
 
     # Device guards: personal-device policy, then the reservation guard —
     # both before the readiness gate, so a refused device is never touched.
-    refused = _device_guard(device, allow_personal)
+    refused = _device_guard(device, allow_personal, effective_owner)
     if refused:
         return refused
 
@@ -325,8 +382,9 @@ async def crucible_bvt(
     # a bogus failure. `discover()` not listing the device, or raising,
     # leaves device_platform None and the suite untouched: the existing
     # device-readiness gate already handles an absent/unreachable device.
+    adapter = _bvt_adapter(effective_owner)
     try:
-        devices = ctx._bvt_nerve_adapter.discover()
+        devices = adapter.discover()
     except Exception as e:
         logger.warning("crucible_bvt_discover_failed", device=device, error=str(e))
         devices = []
@@ -346,11 +404,12 @@ async def crucible_bvt(
             )
         suite.tests = matching_tests
 
-    out = Path(output_dir) if output_dir else Path(tempfile.mkdtemp(prefix="crucible_bvt_"))
-    out.mkdir(parents=True, exist_ok=True)
-
-    runner = BVTRunner(nerve=ctx._bvt_nerve_adapter, output_dir=out)
-    result = runner.run_suite(suite, device=device, app_path=app_path, budget_s=budget_s)
+    try:
+        out = _prepare_bvt_output_dir(output_dir)
+        runner = BVTRunner(nerve=adapter, output_dir=out)
+        result = runner.run_suite(suite, device=device, app_path=app_path, budget_s=budget_s)
+    except InvalidToolArg as exc:
+        return json.dumps(validation_error(exc))
 
     # Device-readiness gate skipped the whole suite → precondition, not a run.
     if result.suite_skip_reason:
@@ -386,6 +445,7 @@ async def crucible_bvt(
 
     # Observational visual compare (never flips result.passed). Merge into the
     # dict before the single json.dumps so the block is real JSON, not a string.
+    _attach_reservation_owner(result_dict, effective_owner)
     _attach_visual_compare(result_dict, result.tests, compare_against_baseline, project)
 
     logger.info(

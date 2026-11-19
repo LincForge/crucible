@@ -17,7 +17,8 @@ import structlog
 
 from .deployer import artifacts_older_than_head
 from .forge_integration import ForgeProject, ForgeProjectReader
-from .scorer import QualityScore, QualityScorer
+from .scorer import SCORE_FUTURE_SLACK, QualityScore, QualityScorer
+from .scorer import parse_score_timestamp as _parse_score_timestamp
 
 logger = structlog.get_logger().bind(domain="build_pipeline")
 
@@ -161,20 +162,19 @@ def _artifact_staleness_detail(items: list[CheckItem], project_dir: str) -> str:
     return f" (artifact_older_than_head={artifacts_older_than_head(paths, project_dir)})"
 
 
-def _parse_score_timestamp(raw_timestamp: str | None) -> datetime | None:
-    """Parse an ISO timestamp from a quality score, treating naive as UTC."""
-    if not isinstance(raw_timestamp, str):
-        return None
-    raw = raw_timestamp.strip()
-    if not raw:
-        return None
-    if raw.endswith(("Z", "z")):
-        raw = raw[:-1] + "+00:00"
-    try:
-        dt = datetime.fromisoformat(raw)
-        return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
-    except (ValueError, TypeError):
-        return None
+def _format_skipped_names(skipped: object) -> str | None:
+    """Return a comma-joined filename string when *skipped* is a non-empty list."""
+    if isinstance(skipped, list) and skipped:
+        return ", ".join(str(name) for name in skipped)
+    return None
+
+
+def _missing_score_detail(scorer: QualityScorer) -> str:
+    """Build failure detail when ``load_latest`` returns ``None``."""
+    names = _format_skipped_names(getattr(scorer, "last_skipped_files", None))
+    if names:
+        return f"Latest quality score file(s) skipped ({names}) — re-run crucible_assay"
+    return "No quality score found — run crucible_assay first"
 
 
 def _check_score_staleness(latest: QualityScore) -> str | None:
@@ -190,13 +190,26 @@ def _check_score_staleness(latest: QualityScore) -> str | None:
     if parsed_dt is None:
         return "Quality score has unparseable timestamp — re-run crucible_assay"
 
-    age = datetime.now(UTC) - parsed_dt
+    now = datetime.now(UTC)
+    if parsed_dt > now + SCORE_FUTURE_SLACK:
+        return (
+            "Quality score is dated in the future — check the host clock and re-run crucible_assay"
+        )
+    age = now - parsed_dt
     if age > timedelta(days=SCORE_MAX_AGE_DAYS):
         return (
             f"Quality score is {age.days} days old"
             f" (max {SCORE_MAX_AGE_DAYS}) — re-run crucible_assay"
         )
     return None
+
+
+def _check_score_trust(latest: QualityScore) -> str | None:
+    """Fail if ``load_latest`` bypassed newer skipped files or the score is stale."""
+    names = _format_skipped_names(getattr(latest, "skipped_files", None))
+    if names:
+        return f"Newer quality score file(s) skipped ({names}) — re-run crucible_assay"
+    return _check_score_staleness(latest)
 
 
 def _compute_blocking(checks: list[PreflightCheck]) -> list[str]:
@@ -306,10 +319,10 @@ class PreflightChecker:
         if not latest:
             check.status = "fail"
             check.score = 0.0
-            check.detail = "No quality score found — run crucible_assay first"
+            check.detail = _missing_score_detail(self._scorer)
             return check
 
-        staleness_detail = _check_score_staleness(latest)
+        staleness_detail = _check_score_trust(latest)
         if staleness_detail:
             check.status = "fail"
             check.score = 0.0

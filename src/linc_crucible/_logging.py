@@ -4,10 +4,30 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 import structlog
+from structlog.typing import EventDict, WrappedLogger
+
+from ._redaction import redact_event
 
 logging = sys.modules.get("logging") or __import__("logging")
+
+
+def redact_home_processor(
+    logger: WrappedLogger, method_name: str, event_dict: EventDict
+) -> EventDict:
+    """Structlog processor rewriting ``Path.home()`` to ``~`` in every event value.
+
+    Shares :func:`._redaction.redact_event` with ``fuelcheck``: tuples/sets, exception
+    objects and a logged traceback (``exc_info``, formatted before the renderer sees it)
+    are redacted too.
+    """
+    try:
+        home = Path.home()
+    except RuntimeError:
+        return event_dict
+    return redact_event(logger, method_name, event_dict, home)
 
 
 class _CurrentStderr:
@@ -50,6 +70,9 @@ def configure_cli_structlog(level: str | None = None) -> None:
     from linc_cli_kit import configure_structlog_stderr
 
     configure_structlog_stderr()
+    chain = structlog.get_config()["processors"]
+    if redact_home_processor not in chain:
+        chain.insert(-1, redact_home_processor)
     name = (level or os.environ.get("LINC_LOG_LEVEL") or "WARNING").upper()
     log_level = getattr(logging, name, logging.WARNING)
     structlog.configure(
@@ -71,6 +94,7 @@ def configure(*, verbose: bool = False) -> None:
             structlog.processors.TimeStamper(fmt="iso"),
             structlog.processors.StackInfoRenderer(),
             structlog.dev.set_exc_info,
+            redact_home_processor,
             structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
         ],
         logger_factory=structlog.stdlib.LoggerFactory(),

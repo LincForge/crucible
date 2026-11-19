@@ -29,6 +29,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from linc_cli_kit import SDKToolError
 
 from linc_crucible.core.observability import log_mcp_call
 from linc_crucible.mcp_server import _observed_tool, server
@@ -94,7 +95,13 @@ def _is_wrapper_layer_failure(exc: BaseException, tool_name: str) -> bool:
        bug.
 
     Otherwise: handler-internal failure (acceptable — body was entered).
+
+    `_observed_tool`'s client boundary re-raises a non-ToolError failure as the SDK
+    ToolError chained to the original (mcp 2.1+ hides other exception text), so the
+    predicate classifies that original exception.
     """
+    if isinstance(exc, SDKToolError) and exc.__cause__ is not None:
+        exc = exc.__cause__
     frames = traceback.extract_tb(exc.__traceback__)
     if not frames:
         # No traceback context — be conservative and treat as wrapper failure

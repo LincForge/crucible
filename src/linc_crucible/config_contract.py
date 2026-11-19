@@ -115,9 +115,16 @@ ENV_VARS: tuple[EnvVar, ...] = (
         "API key for the optional MobSF security scan (`assay` mode `full`)",
     ),
     EnvVar(
+        "NERVE_OWNER",
+        _UNSET,
+        "Default nerve reservation lease owner for `bvt` when `--owner` is not passed",
+    ),
+    EnvVar(
         "ANDROID_HOME",
         _UNSET,
-        "Android SDK root; its `build-tools/*/aapt2` reads the package name from a built APK",
+        "Android SDK root; `build-tools/*/aapt2` reads APK package/manifest metadata (for `pour` "
+        "and `apk-audit`) and `build-tools/*/apksigner` verifies APK signing certificates "
+        "(`apk-audit`, probed by `fuelcheck`)",
     ),
     EnvVar(
         "ANDROID_SDK_ROOT",

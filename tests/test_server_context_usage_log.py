@@ -6,6 +6,10 @@ import errno
 
 import pytest
 from _pytest.monkeypatch import MonkeyPatch
+from linc_cli_kit import SDKToolError
+
+# `_observed_tool` re-raises a tool's own failure as the SDK ToolError chained to it
+# (mcp 2.1+ hides other exception text from the client); the original is the __cause__.
 
 
 def _failing_log(*_args: object, **_kwargs: object) -> None:
@@ -37,8 +41,9 @@ def test_observed_sync_tool_error_not_masked_by_log_failure(monkeypatch: MonkeyP
     def tool() -> None:
         raise ValueError("real failure")
 
-    with pytest.raises(ValueError, match="real failure"):
+    with pytest.raises(SDKToolError, match="ValueError: real failure") as info:
         tool()
+    assert isinstance(info.value.__cause__, ValueError)
 
 
 def test_observed_async_tool_survives_log_failure(monkeypatch: MonkeyPatch) -> None:
@@ -59,8 +64,9 @@ def test_observed_async_tool_survives_log_failure(monkeypatch: MonkeyPatch) -> N
         raise RuntimeError("real async failure")
 
     assert anyio.run(ok) == "done"
-    with pytest.raises(RuntimeError, match="real async failure"):
+    with pytest.raises(SDKToolError, match="RuntimeError: real async failure") as info:
         anyio.run(boom)
+    assert isinstance(info.value.__cause__, RuntimeError)
     assert server_context.usage_log_failures() == before + 2
 
 
@@ -117,8 +123,9 @@ def test_observed_tool_records_failure_fields(monkeypatch: MonkeyPatch) -> None:
     def crucible_demo() -> None:
         raise ValueError("boom")
 
-    with pytest.raises(ValueError, match="boom"):
+    with pytest.raises(SDKToolError, match="ValueError: boom") as info:
         crucible_demo()
+    assert isinstance(info.value.__cause__, ValueError)
     assert recorder.calls == [(("linc-crucible", "crucible_demo", {}, 500.0, False, "boom"), {})]
 
 
@@ -154,8 +161,9 @@ def test_observed_async_tool_records_failure(monkeypatch: MonkeyPatch) -> None:
     async def crucible_async() -> None:
         raise RuntimeError("late")
 
-    with pytest.raises(RuntimeError, match="late"):
+    with pytest.raises(SDKToolError, match="RuntimeError: late") as info:
         anyio.run(crucible_async)
+    assert isinstance(info.value.__cause__, RuntimeError)
     assert recorder.calls == [(("linc-crucible", "crucible_async", {}, 500.0, False, "late"), {})]
 
 
@@ -187,8 +195,9 @@ def test_observed_tool_scrubs_outside_root_path_from_exception_in_redacted_mode(
     def crucible_demo(project: str, device_info: str) -> None:
         raise FileNotFoundError(f"missing '{secret_path}' for {device_info}")
 
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(SDKToolError) as info:
         crucible_demo(project="demo", device_info="Pixel R58N000TEST")
+    assert isinstance(info.value.__cause__, FileNotFoundError)
 
     raw = (tmp_path / "mcp-calls.jsonl").read_text()
     assert secret_path not in raw

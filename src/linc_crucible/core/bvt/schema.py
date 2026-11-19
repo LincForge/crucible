@@ -116,6 +116,7 @@ CAVEATS of ``pm clear`` (Android-only):
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -140,6 +141,10 @@ class BVTTest:
     steps: list[BVTStep] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     package: str = ""
+    # Android launcher activity for ``launch`` of ``package`` (file-level or
+    # per-test ``android_activity:``). Needed when the package has more than
+    # one launcher activity, which nerve refuses to launch by package alone.
+    android_activity: str = ""
 
 
 @dataclass
@@ -252,12 +257,40 @@ def _parse_shorthand_step(raw: dict[str, Any], package: str) -> BVTStep:
     raise ValueError(msg)
 
 
-def _parse_test(raw: dict[str, Any], package: str) -> BVTTest:
+# Same grammar as linc-ops' daily runner (``_ANDROID_ACTIVITY_RE``): a dotted
+# Java class name, optionally ``.``-relative. fullmatch with \A...\Z so a
+# trailing newline or shell syntax never reaches ``am start -n``.
+_ANDROID_ACTIVITY_RE = re.compile(r"\A\.?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\Z")
+
+
+def _parse_android_activity(value: object, where: str) -> str:
+    """Validate an optional ``android_activity`` value; ``None``/empty -> ``""``.
+
+    Raises ValueError at load time (input boundary) for a non-string or a value
+    outside the activity grammar, so a bad spec fails before any device call.
+    """
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, str) or not _ANDROID_ACTIVITY_RE.fullmatch(value):
+        msg = f"{where}: 'android_activity' must be a Java class name, got {value!r}"
+        raise ValueError(msg)
+    return value
+
+
+def _parse_test(raw: dict[str, Any], package: str, android_activity: str = "") -> BVTTest:
     """Parse a single test definition from YAML."""
     name = raw.get("name", "unnamed")
     tags = raw.get("tags", [])
     steps = [_parse_step(s, package) for s in raw.get("steps", [])]
-    return BVTTest(name=name, steps=steps, tags=tags, package=package)
+    activity = _test_android_activity(raw, name, android_activity)
+    return BVTTest(name=name, steps=steps, tags=tags, package=package, android_activity=activity)
+
+
+def _test_android_activity(raw: dict[str, Any], name: str, file_default: str) -> str:
+    """A test's own ``android_activity`` when it sets one, else the file's."""
+    if "android_activity" not in raw:
+        return file_default
+    return _parse_android_activity(raw["android_activity"], f"BVT test '{name}'")
 
 
 def load_bvt_file(path: Path, package_default: str = "") -> tuple[str, list[BVTTest], str | None]:
@@ -285,7 +318,8 @@ def load_bvt_file(path: Path, package_default: str = "") -> tuple[str, list[BVTT
         names = [t.get("name", "unnamed") for t in raw_tests]
         msg = f"BVT file {path}: no package (set 'package:' in the file). tests={names}"
         raise ValueError(msg)
-    tests = [_parse_test(t, package) for t in raw_tests]
+    file_activity = _parse_android_activity(data.get("android_activity"), f"BVT file {path}")
+    tests = [_parse_test(t, package, file_activity) for t in raw_tests]
     return package, tests, device
 
 

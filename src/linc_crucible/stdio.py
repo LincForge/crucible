@@ -1,10 +1,11 @@
 """Custom stdio transport — native asyncio to avoid anyio.wrap_file deadlock.
 
 The MCP SDK's stdio_server uses anyio.wrap_file() which deadlocks after ~2 tool
-calls when tools use anyio.to_thread. Note: MCP SDK v1.26.0 calls sync tools
-directly on the event loop without anyio.to_thread wrapping.
+calls when tools use anyio.to_thread. mcp 2.x runs sync tools on anyio worker
+threads too, so the stdio pipes must not compete for that pool.
 This module uses asyncio.connect_read_pipe/connect_write_pipe for native async
-I/O that doesn't compete with anyio's thread pool.
+I/O that doesn't compete with anyio's thread pool. Parsing and serialization
+match the SDK's own stdio transport (mcp 2.3 ``mcp/server/stdio.py``).
 
 Ported from linc-nerve.
 """
@@ -18,7 +19,16 @@ import anyio
 import anyio.lowlevel
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from mcp.shared.message import SessionMessage
-from mcp.types import JSONRPCMessage
+from mcp.types import jsonrpc_message_adapter
+
+# Longest stdin line the reader buffers. asyncio's default StreamReader limit is
+# 64 KiB, and a longer line used to raise ValueError out of stdin_reader and kill
+# the server. A line past this cap is reported as one Exception item instead.
+MAX_LINE_BYTES = 16 * 1024 * 1024
+
+
+class LineTooLongError(ValueError):
+    """A stdin line exceeded :data:`MAX_LINE_BYTES` and was discarded."""
 
 
 @asynccontextmanager
@@ -42,7 +52,7 @@ async def stdio_server() -> AsyncGenerator[
     loop = asyncio.get_event_loop()
 
     # Native asyncio reader for stdin — no threads involved.
-    reader = asyncio.StreamReader()
+    reader = asyncio.StreamReader(limit=MAX_LINE_BYTES)
     protocol = asyncio.StreamReaderProtocol(reader)
     await loop.connect_read_pipe(lambda: protocol, sys.stdin.buffer)
 
@@ -58,11 +68,20 @@ async def stdio_server() -> AsyncGenerator[
         try:
             async with read_stream_writer:
                 while True:
-                    line = await reader.readline()
+                    try:
+                        line = await reader.readline()
+                    except ValueError:
+                        # Over-limit line: readline() has already discarded the
+                        # buffered bytes; any tail of the line arrives as the next
+                        # (unparseable) line and is reported the same way.
+                        await read_stream_writer.send(
+                            LineTooLongError(f"stdin line exceeds {MAX_LINE_BYTES} bytes")
+                        )
+                        continue
                     if not line:
                         break
                     try:
-                        message = JSONRPCMessage.model_validate_json(line)
+                        message = jsonrpc_message_adapter.validate_json(line, by_name=False)
                     except Exception as exc:
                         await read_stream_writer.send(exc)
                         continue
@@ -75,7 +94,7 @@ async def stdio_server() -> AsyncGenerator[
             async with write_stream_reader:
                 async for session_message in write_stream_reader:
                     json_str = session_message.message.model_dump_json(
-                        by_alias=True, exclude_none=True
+                        by_alias=True, exclude_unset=True
                     )
                     w_transport.write((json_str + "\n").encode("utf-8"))
         except anyio.ClosedResourceError:

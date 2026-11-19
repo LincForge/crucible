@@ -23,6 +23,7 @@ logger = structlog.get_logger().bind(domain="package_resolver")
 _APP_ID_RE = re.compile(r'applicationId\s*=\s*"([^"]+)"')
 _SUFFIX_RE = re.compile(r'applicationIdSuffix\s*=\s*"([^"]+)"')
 _BADGING_NAME_RE = re.compile(r"package:\s*name='([^']+)'")
+_BUILD_TOOLS_VER_RE = re.compile(r"^(\d+(?:\.\d+)*)(.*)$")
 _WELL_KNOWN = ("app", "composeApp", "androidApp", "demo-app")
 
 
@@ -93,21 +94,41 @@ def source_parse_package(project_path: str, build_type: str = "debug") -> str | 
     return f"{base}{suffix}" if suffix else base
 
 
-def find_aapt() -> str | None:
-    """Locate aapt2/aapt: PATH first, then $ANDROID_HOME/build-tools/*/."""
-    for tool in ("aapt2", "aapt"):
+def _build_tools_version_key(version_str: str) -> tuple[int, tuple[int, ...], int, str]:
+    """Parse an Android build-tools directory name into a sortable version key."""
+    m = _BUILD_TOOLS_VER_RE.match(version_str)
+    if not m:
+        return (0, (), 0, version_str)
+    nums = tuple(int(part) for part in m.group(1).split("."))
+    suffix = m.group(2)
+    return (1, nums, 1 if not suffix else 0, suffix)
+
+
+def find_build_tools_binary(*tools: str) -> str | None:
+    """Locate the first matching tool on PATH, else highest-versioned ``build-tools/*``."""
+    for tool in tools:
         found = shutil.which(tool)
         if found:
             return found
     home = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
-    if home:
-        hits = sorted(
-            glob.glob(os.path.join(home, "build-tools", "*", "aapt2"))
-            + glob.glob(os.path.join(home, "build-tools", "*", "aapt"))
-        )
-        if hits:
-            return hits[-1]
-    return None
+    if not home:
+        return None
+    candidates: list[tuple[tuple[int, tuple[int, ...], int, str], int, str]] = []
+    for priority, tool in enumerate(tools):
+        for hit in glob.glob(os.path.join(home, "build-tools", "*", tool)):
+            if os.path.isfile(hit):
+                ver_key = _build_tools_version_key(Path(hit).parent.name)
+                candidates.append((ver_key, -priority, hit))
+    if not candidates:
+        return None
+    # Highest version first, then the earlier-listed tool (aapt2 before aapt).
+    best = max(candidates, key=lambda item: (item[0], item[1]))
+    return best[2]
+
+
+def find_aapt() -> str | None:
+    """Locate aapt2/aapt: PATH first, then $ANDROID_HOME/build-tools/*/."""
+    return find_build_tools_binary("aapt2", "aapt")
 
 
 def badge_package(apk_path: str) -> str | None:

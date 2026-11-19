@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 import tomllib
+import urllib.parse
 from pathlib import Path
 
 import anyio
@@ -56,7 +57,12 @@ def test_notice_names_linc_innovations_and_no_vendored_binary() -> None:
 def test_contributing_requires_dco() -> None:
     contributing = (REPO / "CONTRIBUTING.md").read_text(encoding="utf-8")
     assert "Signed-off-by" in contributing
-    assert "https://developercertificate.org/" in contributing
+    urls = [u.rstrip(".") for u in re.findall(r"https?://[^\s)>]+", contributing)]
+    parsed_urls = [urllib.parse.urlparse(u) for u in urls]
+    assert any(
+        u_parsed.scheme == "https" and u_parsed.netloc == "developercertificate.org"
+        for u_parsed in parsed_urls
+    )
     assert "release mirror" in contributing
     assert "crucible fuelcheck" in contributing
 
@@ -87,10 +93,11 @@ def test_security_has_reporting_trust_boundary_and_review_stub() -> None:
     assert "f38fe86a756dfbd46bed3fdc43d3770c2a6e21fc0f044c22657963d22df92668" in sha256_hashes
 
 
-def test_changelog_headings_are_unreleased_then_0_2_0_then_the_0_1_0_baseline() -> None:
+def test_changelog_headings_are_unreleased_then_releases_then_the_0_1_0_baseline() -> None:
     changelog = (REPO / "CHANGELOG.md").read_text(encoding="utf-8")
     headings = re.findall(r"^## \[(.+?)\].*$", changelog, re.M)
-    assert headings[:3] == ["Unreleased", "0.2.0", "0.1.0"]
+    assert headings[:4] == ["Unreleased", "0.3.0", "0.2.0", "0.1.0"]
+    assert "## [0.3.0] - 2026-11-19" in changelog
     assert "## [0.2.0] - 2026-10-24" in changelog
     release_section = changelog.split("## [0.2.0]", 1)[1].split("\n## [0.1.0]", 1)[0]
     assert "### Added" in release_section
@@ -99,12 +106,12 @@ def test_changelog_headings_are_unreleased_then_0_2_0_then_the_0_1_0_baseline() 
     assert "(6 at the time of the 0.1.0 baseline)" in release_section
 
 
-def test_version_is_0_2_0_everywhere() -> None:
+def test_version_is_0_3_0_everywhere() -> None:
     from linc_crucible import __version__
     from linc_crucible.cli import CRUCIBLE_BANNER
 
-    assert _pyproject()["project"]["version"] == "0.2.0"
-    assert __version__ == "0.2.0"
+    assert _pyproject()["project"]["version"] == "0.3.0"
+    assert __version__ == "0.3.0"
     assert f"v{__version__}" in CRUCIBLE_BANNER
 
 
@@ -318,14 +325,19 @@ _GENERIC_TRACKER_ID = re.compile(
 
 
 def test_src_has_no_generic_tracker_id_patterns() -> None:
-    """[contract] shipped source files under src/ contain no internal tracker ID patterns."""
+    """[contract] shipped package source files contain no internal tracker ID patterns."""
+    import linc_crucible
+
+    pkg_root = Path(linc_crucible.__file__).resolve().parent
+    py_files = sorted(pkg_root.rglob("*.py"))
+    assert py_files, f"no Python files found under {pkg_root}"
     hits: list[str] = []
-    for path in sorted((REPO / "src").rglob("*.py")):
-        rel = path.relative_to(REPO).as_posix()
+    for path in py_files:
+        rel = path.relative_to(pkg_root.parent).as_posix()
         for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
             if _GENERIC_TRACKER_ID.search(line):
                 hits.append(f"{rel}:{lineno}: {line.strip()}")
-    assert hits == [], f"tracker ID patterns in src/: {hits}"
+    assert hits == [], f"tracker ID patterns in package source: {hits}"
 
 
 def test_security_and_readme_document_project_shell_and_trusted_nerve_peer() -> None:
@@ -399,3 +411,117 @@ def test_readme_cli_baseline_parity_claim_is_accurate() -> None:
     for mcp_only in ("a11y", "latest", "promote"):
         assert mcp_only in tools_sec
     assert "MCP-only" in tools_sec
+
+
+def test_readme_documents_apk_audit_and_strict_measured() -> None:
+    """[contract] README.md documents apk-audit, --strict, measured, tools, and assetlinks."""
+    readme = _readme()
+    sec = _section(readme, "## APK audit")
+    flat = _flat(sec)
+    for token in (
+        "apk-audit",
+        "--strict",
+        "measured",
+        "passed",
+        "aapt2",
+        "apksigner",
+        "ANDROID_HOME",
+        "ANDROID_SDK_ROOT",
+        "PATH",
+        "--assetlinks",
+        "assetlinks.json",
+        "delegate_permission/common.handle_all_urls",
+        "sha256_cert_fingerprints",
+        "archive",
+        "manifest",
+        "signing",
+        "findings",
+        "summary",
+    ):
+        assert token in flat, f"README ## APK audit missing {token!r}"
+    assert "without `--strict`" in sec.lower() or "without --strict" in flat.lower()
+    assert "exits `0`" in sec or "exit `0`" in sec or "exit 0" in flat.lower()
+    assert "exits `1`" in sec or "exit `1`" in sec or "exit 1" in flat.lower()
+    assert "exits `2`" in sec or "exit `2`" in sec or "exit 2" in flat.lower()
+
+
+def test_readme_exit_codes_unmeasured_tests_and_cli_usage_log() -> None:
+    """[contract] README covers apk-audit exit codes, zero-test unmeasured, and CLI usage log."""
+    readme = _readme()
+
+    quickstart = _flat(_section(readme, "## Quickstart"))
+    assert "apk-audit" in quickstart
+    assert "--strict" in quickstart
+
+    setup = _flat(_section(readme, "## Project setup"))
+    assert "0 parsed tests" in setup
+    assert "unmeasured" in setup
+
+    config = _section(readme, "## Configuration")
+    android_row = _block_containing(config, "| `ANDROID_HOME` |", "\n")
+    assert "apksigner" in android_row
+    assert "apk-audit" in android_row
+    assert "fuelcheck" in android_row
+
+    state_row = _block_containing(config, "| `$LINC_HOME/mcp-calls.jsonl` |", "\n")
+    assert "cli" in state_row
+
+    trust = _flat(_section(readme, "## Trust")).lower()
+    assert "cli" in trust and "$linc_home/mcp-calls.jsonl" in trust
+
+
+def test_changelog_0_3_0_documents_molecule_fixes_and_cli_kit_floor() -> None:
+    """[contract] CHANGELOG [0.3.0] covers molecule fixes and requires linc-cli-kit 0.3.1."""
+    changelog = (REPO / "CHANGELOG.md").read_text(encoding="utf-8")
+    unreleased = changelog.split("## [0.3.0]", 1)[1].split("\n## [0.2.0]", 1)[0]
+    _assert_cli_kit_floor_is_0_3_1(_pyproject()["project"]["dependencies"])
+    for token in (
+        "linc-cli-kit>=0.3.1",
+        "apk-audit",
+        "summary.measured",
+        "--strict",
+        "aapt2",
+        "apksigner",
+        "output_dir",
+        "retry_backoff",
+        "0 parsed tests",
+    ):
+        assert token in unreleased, f"CHANGELOG [0.3.0] missing {token!r}"
+
+
+def test_readme_documents_junit_xml_rerun_tasks_and_build_tools_order() -> None:
+    """[contract] README names build/test-results, --rerun-tasks, UP-TO-DATE, and build-tools."""
+    readme = _readme()
+    setup = _flat(_section(readme, "## Project setup"))
+    assert "build/test-results" in setup
+    assert "--rerun-tasks" in setup
+    assert "UP-TO-DATE" in setup
+    assert "UNMEASURED" in setup
+    assert "stdout" in setup.lower()
+
+    apk_audit = _flat(_section(readme, "## APK audit"))
+    assert "35.0.0" in apk_audit and "9.0.0" in apk_audit
+    assert "version tuple" in apk_audit.lower() or "numeric" in apk_audit.lower()
+
+
+def _assert_cli_kit_floor_is_0_3_1(dependencies: list[str]) -> None:
+    from packaging.requirements import Requirement
+
+    kits = [Requirement(d) for d in dependencies if Requirement(d).name == "linc-cli-kit"]
+    assert len(kits) == 1, dependencies
+    # The published pyproject may intersect a publish pin with the private floor
+    # (e.g. ">=0.1.4,>=0.3.1"): check the effective floor, not the spelling.
+    assert kits[0].specifier.contains("0.3.1")
+    assert not kits[0].specifier.contains("0.3.0")
+
+
+def test_contract_cli_kit_floor_check_reads_the_effective_floor() -> None:
+    """[contract] the floor check accepts the private and the published spellings and rejects
+    a floor that admits linc-cli-kit 0.3.0."""
+    _assert_cli_kit_floor_is_0_3_1(["httpx>=0.25.0", "linc-cli-kit>=0.3.1"])
+    _assert_cli_kit_floor_is_0_3_1(["linc-cli-kit>=0.1.4,>=0.3.1"])
+    import pytest
+
+    for loose in (["linc-cli-kit>=0.1.4"], ["httpx"], ["linc-cli-kit>=0.3.1", "linc-cli-kit"]):
+        with pytest.raises(AssertionError):
+            _assert_cli_kit_floor_is_0_3_1(loose)

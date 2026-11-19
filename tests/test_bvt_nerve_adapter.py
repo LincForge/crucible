@@ -696,3 +696,29 @@ class TestTreeVerbsStrictRead:
         assert result["success"] is False
         assert "Cannot parse bounds" in result["error"]
         assert not result.get("harness_error", False)
+
+
+class TestLaunchActivity:
+    """[contract] NerveAdapter.launch forwards ``activity`` only when given."""
+
+    def test_activity_forwarded(self) -> None:
+        from unittest.mock import MagicMock
+
+        from linc_crucible.core.nerve_client import NerveClient
+
+        nerve = MagicMock(spec=NerveClient)
+        nerve.launch.return_value = {"success": True}
+        NerveAdapter(nerve=nerve).launch("DEV1", "com.test", activity="com.test.Main")
+        nerve.launch.assert_called_once_with(
+            device="DEV1", package="com.test", activity="com.test.Main"
+        )
+
+    def test_no_activity_keeps_the_old_call(self) -> None:
+        from unittest.mock import MagicMock
+
+        from linc_crucible.core.nerve_client import NerveClient
+
+        nerve = MagicMock(spec=NerveClient)
+        nerve.launch.return_value = {"success": True}
+        NerveAdapter(nerve=nerve).launch("DEV1", "com.test")
+        nerve.launch.assert_called_once_with(device="DEV1", package="com.test")

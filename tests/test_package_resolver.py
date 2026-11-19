@@ -112,6 +112,46 @@ def test_find_aapt_none(monkeypatch):
     assert find_aapt() is None
 
 
+def test_contract_find_aapt_picks_highest_version_tuple_over_string_order(monkeypatch, tmp_path):
+    """[contract] build-tools 9.0.0 and 35.0.0 present -> 35.0.0 chosen."""
+    monkeypatch.setattr("shutil.which", lambda _t: None)
+    monkeypatch.delenv("ANDROID_SDK_ROOT", raising=False)
+    monkeypatch.setenv("ANDROID_HOME", str(tmp_path))
+
+    for ver in ("9.0.0", "35.0.0"):
+        bt = tmp_path / "build-tools" / ver
+        bt.mkdir(parents=True)
+        (bt / "aapt2").write_text("", encoding="utf-8")
+
+    assert find_aapt() == str(tmp_path / "build-tools" / "35.0.0" / "aapt2")
+
+
+def test_find_aapt_version_sorting_and_hostile_dirs(monkeypatch, tmp_path):
+    """Handles pre-releases, non-numeric dirs, directory binaries, and aapt2 > aapt."""
+    monkeypatch.setattr("shutil.which", lambda _t: None)
+    monkeypatch.delenv("ANDROID_SDK_ROOT", raising=False)
+    monkeypatch.setenv("ANDROID_HOME", str(tmp_path))
+
+    # Non-numeric dir alone still resolves without crashing
+    (tmp_path / "build-tools" / "custom").mkdir(parents=True)
+    (tmp_path / "build-tools" / "custom" / "aapt2").write_text("", encoding="utf-8")
+    assert find_aapt() == str(tmp_path / "build-tools" / "custom" / "aapt2")
+
+    # Directory named aapt2 in 99.0.0 is ignored; 35.0.0 beats 35.0.0-rc1 and 9.0.0
+    (tmp_path / "build-tools" / "99.0.0" / "aapt2").mkdir(parents=True)
+    for ver in ("9.0.0", "35.0.0-rc1"):
+        bt = tmp_path / "build-tools" / ver
+        bt.mkdir(parents=True)
+        (bt / "aapt2").write_text("", encoding="utf-8")
+    (tmp_path / "build-tools" / "35.0.0").mkdir(parents=True)
+    (tmp_path / "build-tools" / "35.0.0" / "aapt").write_text("", encoding="utf-8")
+    assert find_aapt() == str(tmp_path / "build-tools" / "35.0.0" / "aapt")
+
+    # Within the same version, aapt2 beats aapt
+    (tmp_path / "build-tools" / "35.0.0" / "aapt2").write_text("", encoding="utf-8")
+    assert find_aapt() == str(tmp_path / "build-tools" / "35.0.0" / "aapt2")
+
+
 def test_badge_package_parses_name(monkeypatch):
     monkeypatch.setattr("linc_crucible.core.package_resolver.find_aapt", lambda: "/x/aapt")
     cp = subprocess.CompletedProcess(args=[], returncode=0, stdout=BADGING, stderr="")
@@ -221,3 +261,14 @@ def test_resolve_passes_build_type_and_defaults_manifest_package(monkeypatch, tm
     assert resolve_effective_package(str(tmp_path), "release") == "com.example.release"
     assert seen == [(str(tmp_path), "release")]
 
+
+def test_contract_build_tools_version_key_exact_tuples() -> None:
+    """[contract] exact sort keys: unparseable names sort below every version, a release
+    above its own release candidate, and versions compare numerically."""
+    from linc_crucible.core.package_resolver import _build_tools_version_key as key
+
+    assert key("abc") == (0, (), 0, "abc")
+    assert key("35.0.0") == (1, (35, 0, 0), 1, "")
+    assert key("35.0.0-rc1") == (1, (35, 0, 0), 0, "-rc1")
+    assert key("9.0.0") < key("35.0.0-rc1") < key("35.0.0")
+    assert key("abc") < key("1")

@@ -11,6 +11,7 @@ import yaml
 from linc_crucible.core.bvt.schema import (
     BVTStep,
     _parse_step,
+    _parse_test,
     load_bvt_dir,
     load_bvt_file,
 )
@@ -406,3 +407,58 @@ class TestParseConditional:
     def test_unknown_sibling_key_rejected(self) -> None:
         with pytest.raises(ValueError, match=r"[Uu]nexpected"):
             _parse_step({"if": {"element": "x"}, "then": [], "finally": []}, package="")
+
+
+class TestAndroidActivity:
+    """[contract] ``android_activity``: file-level default, per-test override, load-time reject."""
+
+    def _write(self, tmp_path: Path, body: str) -> Path:
+        p = tmp_path / "spec.yaml"
+        p.write_text(dedent(body))
+        return p
+
+    def test_empty_string_is_absent(self, tmp_path: Path) -> None:
+        path = self._write(
+            tmp_path,
+            """\
+            package: com.app
+            android_activity: ""
+            tests:
+              - name: a
+                steps: []
+            """,
+        )
+        _pkg, tests, _dev = load_bvt_file(path)
+        assert tests[0].android_activity == ""
+
+    def test_parse_test_default_activity_is_empty(self) -> None:
+        test = _parse_test({"name": "a", "steps": []}, "com.app")
+        assert test.android_activity == ""
+
+    def test_per_test_error_names_the_test(self, tmp_path: Path) -> None:
+        path = self._write(
+            tmp_path,
+            """\
+            package: com.app
+            tests:
+              - name: cold_start_to_home
+                android_activity: "Main;reboot"
+                steps: []
+            """,
+        )
+        with pytest.raises(ValueError, match=r"BVT test 'cold_start_to_home': 'android_activity'"):
+            load_bvt_file(path)
+
+    def test_file_error_names_the_file(self, tmp_path: Path) -> None:
+        path = self._write(
+            tmp_path,
+            """\
+            package: com.app
+            android_activity: "Main reboot"
+            tests:
+              - name: a
+                steps: []
+            """,
+        )
+        with pytest.raises(ValueError, match=r"BVT file .*spec\.yaml: 'android_activity'"):
+            load_bvt_file(path)

@@ -264,12 +264,15 @@ class TestInferBundleId:
 
 
 def test_no_lincmobile_in_src() -> None:
-    """[contract] git grep -n lincmobile -- src prints nothing."""
-    src_root = Path(__file__).resolve().parents[1] / "src"
+    """[contract] shipped linc_crucible package contains no 'lincmobile' references."""
+    import linc_crucible
+
+    pkg_root = Path(linc_crucible.__file__).resolve().parent
+    py_files = sorted(pkg_root.rglob("*.py"))
+    assert py_files, f"no Python files found under {pkg_root}"
     hits: list[str] = []
-    for path in sorted(src_root.rglob("*.py")):
+    for path in py_files:
         for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
             if "lincmobile" in line:
-                hits.append(f"{path.relative_to(src_root.parent)}:{lineno}:{line}")
+                hits.append(f"{path.relative_to(pkg_root.parent)}:{lineno}:{line}")
     assert hits == []
-

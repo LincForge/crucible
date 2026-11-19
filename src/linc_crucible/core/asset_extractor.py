@@ -1,5 +1,10 @@
+import hashlib
 import json
+import math
+import os
+import re
 import shutil
+import stat
 import tempfile
 import time
 from datetime import UTC, datetime
@@ -11,10 +16,14 @@ import numpy as np
 import structlog
 from PIL import Image, UnidentifiedImageError
 
+from linc_crucible._redaction import redact_home
 from linc_crucible.core.asset_config import AssetExtractorConfig
 from linc_crucible.core.state_paths import ensure_private_dir
 
 logger = structlog.get_logger().bind(domain="asset_extractor")
+
+_SAFE_STEM_RE = re.compile(r"[^A-Za-z0-9._-]")
+_MAX_STEM_LEN = 100
 
 _ASO_SCHEMA = json.dumps(
     {
@@ -68,39 +77,55 @@ def _laplacian_variance(gray: np.ndarray) -> float:
     return float(laplacian.var())
 
 
+class _FilteredFrames(list):
+    """List of surviving frame paths carrying ``skipped_frames`` reason counts."""
+
+    def __init__(self, survivors: list[Path], skipped_frames: dict[str, int]) -> None:
+        super().__init__(survivors)
+        self.skipped_frames = skipped_frames
+
+
+def _classify_frame(
+    path: Path, blur_threshold: float, phash_threshold: int, seen_hashes: list
+) -> str | None:
+    """Return None when ``path`` survives filtering, or the skip reason key."""
+    try:
+        luma = Image.open(path).convert("L")
+    except Image.DecompressionBombError:
+        return "decompression_bomb"
+    except (OSError, UnidentifiedImageError):
+        return "unreadable"
+
+    if _laplacian_variance(np.asarray(luma, dtype=np.float64)) < blur_threshold:
+        return "blurry"
+
+    # phash reduces to luma internally, so hashing the L image matches hashing RGB.
+    phash = imagehash.phash(luma)
+    if any(phash - seen <= phash_threshold for seen in seen_hashes):
+        return "duplicate"
+
+    seen_hashes.append(phash)
+    return None
+
+
 def filter_frames(
-    frame_paths: list[Path], blur_threshold: float, phash_threshold: int
+    frame_paths: list[Path],
+    blur_threshold: float,
+    phash_threshold: int,
+    skipped_frames: dict[str, int] | None = None,
 ) -> list[Path]:
-    survivors = []
-    seen_hashes = []
+    survivors: list[Path] = []
+    seen_hashes: list = []
+    counts = skipped_frames if skipped_frames is not None else {}
 
     for path in frame_paths:
-        # Load image
-        try:
-            img_pil = Image.open(path).convert("RGB")
-        except (OSError, UnidentifiedImageError):
-            continue
-
-        # Check blur
-        gray = np.asarray(img_pil.convert("L"), dtype=np.float64)
-        variance = _laplacian_variance(gray)
-        if variance < blur_threshold:
-            continue
-
-        # Check dedup
-        phash = imagehash.phash(img_pil)
-
-        is_duplicate = False
-        for seen in seen_hashes:
-            if phash - seen <= phash_threshold:
-                is_duplicate = True
-                break
-
-        if not is_duplicate:
-            seen_hashes.append(phash)
+        reason = _classify_frame(path, blur_threshold, phash_threshold, seen_hashes)
+        if reason is None:
             survivors.append(path)
+        else:
+            counts[reason] = counts.get(reason, 0) + 1
 
-    return survivors
+    return _FilteredFrames(survivors, counts)
 
 
 def parse_ai_response(response_text: str) -> dict:
@@ -238,32 +263,150 @@ def rank_frames(
         return _fallback_picks(survivors, max_assets)
 
 
+def _redact_path_text(text: str) -> str:
+    """Redact the user's home directory from error text via :func:`redact_home`."""
+    try:
+        home = Path.home()
+    except RuntimeError:
+        home = None
+    return redact_home(text, home)
+
+
+def _resolve_regular_video(video_path: str) -> Path:
+    """Resolve ``video_path`` and verify it is a regular file via :func:`os.stat`."""
+    resolved = Path(video_path).resolve()
+    try:
+        st = os.stat(resolved)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(_redact_path_text(f"Video {video_path} not found")) from exc
+    except OSError as exc:
+        raise ValueError(f"unreadable video: {type(exc).__name__}") from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError("video_path must be a regular file")
+    return resolved
+
+
+def _safe_stem(raw_stem: str) -> str:
+    """Filter ``raw_stem`` to ``[A-Za-z0-9._-]`` (max 100 chars), refusing empty or dot stems."""
+    stem = _SAFE_STEM_RE.sub("_", raw_stem)[:_MAX_STEM_LEN]
+    if not stem or stem in {".", ".."}:
+        raise ValueError("video_path stem must be a non-empty safe name")
+    return stem
+
+
+def _ensure_inside_base(output_dir: Path, base_output_dir: Path) -> None:
+    """Prove ``output_dir.resolve()`` is strictly inside ``base_output_dir.resolve()``."""
+    base_resolved = base_output_dir.resolve()
+    out_resolved = output_dir.resolve()
+    if out_resolved == base_resolved or not out_resolved.is_relative_to(base_resolved):
+        raise ValueError("output_dir resolves outside base_output_dir")
+
+
+def _has_manifest_collision(manifest_path: Path, resolved_video: Path) -> bool:
+    """Return True when ``manifest_path`` exists and records a different source video."""
+    if not manifest_path.exists():
+        return False
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return True
+    if not isinstance(data, dict):
+        return True
+    recorded = data.get("video_path") or data.get("video")
+    return recorded != str(resolved_video)
+
+
+def _resolve_output_dir(stem: str, resolved_video: Path, base_output_dir: Path) -> Path:
+    """Return an ``output_dir`` proven inside ``base_output_dir``, disambiguating collisions."""
+    output_dir = base_output_dir / stem
+    _ensure_inside_base(output_dir, base_output_dir)
+    if _has_manifest_collision(output_dir / "manifest.json", resolved_video):
+        suffix = hashlib.sha256(str(resolved_video).encode("utf-8")).hexdigest()[:8]
+        output_dir = base_output_dir / f"{stem}_{suffix}"
+        _ensure_inside_base(output_dir, base_output_dir)
+    return output_dir
+
+
+def _estimated_stream_frames(stream, fps) -> int:
+    """Return the known or duration-estimated frame count for ``stream`` (<= 0 when unknown).
+
+    PyAV always exposes ``frames`` (0 when unknown), ``duration`` and ``time_base`` (None when
+    unknown); a non-positive result means "length unknown" and never caps sampling.
+    """
+    if stream.frames > 0:
+        return stream.frames
+    if stream.duration and stream.time_base and fps:
+        return math.ceil(stream.duration * stream.time_base * fps)
+    return 0
+
+
+def _sampling_interval(stream, config: AssetExtractorConfig) -> tuple[int, bool]:
+    """Return ``(frame_interval, capped_by_estimate)`` for ``stream`` under ``config``."""
+    fps = stream.average_rate
+    fps_interval = max(1, int(fps / config.frames_per_second)) if fps else 30
+    if config.max_sampled_frames > 0:
+        # a non-positive estimate gives cap_interval <= 0, which never beats fps_interval >= 1
+        cap_interval = math.ceil(_estimated_stream_frames(stream, fps) / config.max_sampled_frames)
+        if cap_interval > fps_interval:
+            return cap_interval, True
+    return fps_interval, False
+
+
+def _validate_frame_dimensions(frame, max_frame_pixels: int) -> None:
+    """Refuse non-positive or oversized frame dimensions before pixel conversion."""
+    width, height = frame.width, frame.height
+    if width <= 0 or height <= 0 or width * height > max_frame_pixels:
+        raise ValueError(f"frame size {width}x{height} exceeds the cap")
+
+
 def _decode_frames(
     video_path_obj: Path, temp_dir: Path, config: AssetExtractorConfig
 ) -> list[Path]:
     """Decode the video at ``frames_per_second``, writing sampled frames to ``temp_dir``."""
     extracted: list[Path] = []
-    container = av.open(str(video_path_obj))
     try:
+        container = av.open(str(video_path_obj))
+    except (av.error.FFmpegError, OSError) as exc:
+        raise ValueError(f"unreadable video: {type(exc).__name__}") from exc
+    try:
+        if not container.streams.video:
+            raise ValueError(f"no video stream in {video_path_obj.name}")
         stream = container.streams.video[0]
-        fps = stream.average_rate
-        frame_interval = max(1, int(fps / config.frames_per_second)) if fps else 30
+        frame_interval, capped = _sampling_interval(stream, config)
         for count, frame in enumerate(container.decode(stream)):
-            if count % frame_interval == 0:
-                temp_path = temp_dir / f"frame_{count:04d}.png"
-                frame.to_image().save(temp_path)
-                extracted.append(temp_path)
+            if count % frame_interval != 0:
+                continue
+            if len(extracted) >= config.max_sampled_frames:
+                capped = True
+                break
+            _validate_frame_dimensions(frame, config.max_frame_pixels)
+            temp_path = temp_dir / f"frame_{count:04d}.png"
+            frame.to_image().save(temp_path)
+            extracted.append(temp_path)
+        if capped:
+            logger.warning(
+                "asset_frames_capped",
+                cap=config.max_sampled_frames,
+                max_sampled_frames=config.max_sampled_frames,
+            )
     finally:
         container.close()
     return extracted
 
 
 def _finalize(
-    ranking: dict, stem: str, output_dir: Path, config: AssetExtractorConfig, video_name: str
+    ranking: dict,
+    stem: str,
+    output_dir: Path,
+    config: AssetExtractorConfig,
+    video_name: str,
+    video_path: str = "",
+    skipped_frames: dict[str, int] | None = None,
 ) -> dict:
     """Generate variants, move originals out of temp, write manifest. Paths are relative."""
     from linc_crucible.core.asset_variants import make_variants
 
+    skipped = dict(skipped_frames) if skipped_frames else {}
     manifest_assets: list[dict] = []
     result_assets: list[dict] = []
     for idx, pick in enumerate(ranking["picks"]):
@@ -286,8 +429,10 @@ def _finalize(
 
     manifest = {
         "video": video_name,
+        "video_path": video_path,
         "generated_at": datetime.now(UTC).isoformat(),
         "fallback_used": ranking["fallback_used"],
+        "skipped_frames": skipped,
         "assets": manifest_assets,
     }
     manifest_path = output_dir / "manifest.json"
@@ -296,6 +441,7 @@ def _finalize(
         "assets": result_assets,
         "fallback_used": ranking["fallback_used"],
         "manifest_path": str(manifest_path),
+        "skipped_frames": skipped,
     }
 
 
@@ -303,25 +449,35 @@ def extract_assets(video_path: str, config: AssetExtractorConfig = None) -> dict
     if config is None:
         config = AssetExtractorConfig()
 
-    video_path_obj = Path(video_path)
-    if not video_path_obj.exists():
-        raise FileNotFoundError(f"Video {video_path} not found")
-
-    stem = video_path_obj.stem
-    output_dir = config.base_output_dir / stem
+    video_path_obj = _resolve_regular_video(video_path)
+    stem = _safe_stem(video_path_obj.stem)
+    output_dir = _resolve_output_dir(stem, video_path_obj, config.base_output_dir)
     ensure_private_dir(output_dir)  # also creates base_output_dir
     # temp scratch on the SAME filesystem as the output (cheap rename, no /tmp pressure)
     temp_dir = Path(tempfile.mkdtemp(prefix="crucible_assets_", dir=config.base_output_dir))
 
     try:
         extracted = _decode_frames(video_path_obj, temp_dir, config)
-        survivors = filter_frames(extracted, config.blur_threshold, config.phash_threshold)
+        skipped_frames: dict[str, int] = {}
+        survivors = filter_frames(
+            extracted, config.blur_threshold, config.phash_threshold, skipped_frames
+        )
         if not survivors:
             raise ValueError(
-                f"Video {video_path} quality too low: no sharp, distinct frames "
-                "survived pre-filtering"
+                _redact_path_text(
+                    f"Video {video_path} quality too low: no sharp, distinct frames "
+                    "survived pre-filtering"
+                )
             )
         ranking = rank_frames(survivors, temp_dir, config, config.max_assets)
-        return _finalize(ranking, stem, output_dir, config, video_path_obj.name)
+        return _finalize(
+            ranking,
+            stem,
+            output_dir,
+            config,
+            video_path_obj.name,
+            video_path=str(video_path_obj),
+            skipped_frames=skipped_frames,
+        )
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)

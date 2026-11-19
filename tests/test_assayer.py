@@ -1046,14 +1046,16 @@ class TestRunResult:
         assert r.pass_rate == 1.0  # the vacuous guard is unchanged...
         assert r.score_input is None  # ...but it is NOT a scoring signal here
 
-    def test_pass_rate_zero_total_success_true_is_a_measured_pass(self) -> None:
-        """The genuinely-empty-but-green case is a SEPARATE, deliberate
-        decision from the two crash shapes above — `success is True` means
-        the run completed cleanly, so `score_input` still returns the
-        vacuous `pass_rate` of 1.0 rather than being lumped in with a crash.
+    def test_pass_rate_zero_total_success_true_is_unmeasured(self) -> None:
+        """An exit-0 run with zero parsed tests measured nothing (R4 finding 9).
+
+        `pass_rate` still keeps its 1.0 division-by-zero guard, while
+        `score_input` returns `None` so it cannot masquerade as a 100% pass.
         """
-        r = RunResult(total=0, success=True)
-        assert r.score_input == 1.0
+        r = RunResult(total=0, success=True, attempted=True)
+        assert r.pass_rate == 1.0
+        assert r.score_input is None
+        assert r.attempted_unmeasured is True
 
 
 class TestLintResultScoreInput:
@@ -2431,3 +2433,604 @@ class TestMobSFLoopbackProxyIsolation:
         _, scan_call, report_call = mock_client.post.call_args_list
         assert scan_call.kwargs["data"] == {"hash": ""}
         assert report_call.kwargs["data"] == {"hash": ""}
+
+
+class TestZeroParsedTestsUnmeasuredContract:
+    """[contract] Exit-0 test command with zero parsed tests is UNMEASURED (R4 finding 9)."""
+
+    def test_contract_fake_gradlew_build_successful_only_is_unmeasured(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """[contract] A fake ./gradlew that prints only BUILD SUCCESSFUL and exits 0 ->
+        assay unmeasured, ship gate not PASS, CLI exit 1 (fails on 2143889)."""
+        import json
+
+        from click.testing import CliRunner
+
+        import linc_crucible.server_context as server_ctx
+        from linc_crucible.cli import cli
+
+        proj_dir = tmp_path / "projects" / "FakeGradleApp"
+        proj_dir.mkdir(parents=True)
+        (proj_dir / "linc-manifest.yaml").write_text(
+            "identity:\n  name: FakeGradleApp\n", encoding="utf-8"
+        )
+        (proj_dir / ".forge.yaml").write_text(
+            "test_command: ./gradlew test\nframework: gradle_kmp\n", encoding="utf-8"
+        )
+        gradlew = proj_dir / "gradlew"
+        gradlew.write_text("#!/bin/sh\necho 'BUILD SUCCESSFUL'\nexit 0\n", encoding="utf-8")
+        gradlew.chmod(0o755)
+
+        monkeypatch.setenv("LINC_PROJECTS_DIR", str(tmp_path / "projects"))
+        monkeypatch.setenv("FORGE_PROJECTS_FILE", str(tmp_path / "no-projects.yaml"))
+
+        reader = ForgeProjectReader()
+        local_scorer = QualityScorer(scores_dir=tmp_path / "scores")
+        assayer = Assayer(forge_reader=reader, scorer=local_scorer)
+
+        report = assayer.assay("FakeGradleApp", mode="quick")
+        payload = report.to_dict()
+        assert report.tests.total == 0
+        assert report.tests.score_input is None
+        assert report.tests.attempted_unmeasured is True
+        assert payload["measured"] is False
+        assert payload["status"] == "unmeasured"
+        assert payload["tests"]["pass_rate"] is None
+        assert report.quality_score is not None
+        assert report.quality_score.ship_gate is False
+        assert payload["quality_score"]["ship_gate"] is False
+
+        monkeypatch.setattr(server_ctx, "_initialized", True)
+        monkeypatch.setattr(server_ctx, "_assayer", assayer)
+        cli_res = CliRunner().invoke(cli, ["assay", "--project", "FakeGradleApp"])
+        assert cli_res.exit_code == 1
+        assert cli_res.stdout == ""
+        envelope = json.loads(cli_res.stderr)
+        assert envelope["error"]["code"] == "UNMEASURED"
+        assert envelope["error"]["details"]["measured"] is False
+        assert envelope["error"]["details"]["quality_score"]["ship_gate"] is False
+
+    def test_contract_fake_gradlew_with_junit_xml_is_measured(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """[contract] A Gradle run printing only BUILD SUCCESSFUL counts JUnit XML
+        under build/test-results/ first and produces a measured passing score."""
+        proj_dir = tmp_path / "projects" / "GradleXmlApp"
+        xml_dir = proj_dir / "composeApp" / "build" / "test-results" / "testDebugUnitTest"
+        xml_dir.mkdir(parents=True)
+        (xml_dir / "TEST-com.example.AppTest.xml").write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<testsuite name="com.example.AppTest" tests="4" '
+            'skipped="1" failures="0" errors="0">\n'
+            '  <testcase name="ok" classname="com.example.AppTest" time="0.01"/>\n'
+            "</testsuite>\n",
+            encoding="utf-8",
+        )
+        (proj_dir / "linc-manifest.yaml").write_text(
+            "identity:\n  name: GradleXmlApp\n", encoding="utf-8"
+        )
+        (proj_dir / ".forge.yaml").write_text(
+            "test_command: ./gradlew test\nframework: gradle_kmp\n", encoding="utf-8"
+        )
+        gradlew = proj_dir / "gradlew"
+        gradlew.write_text("#!/bin/sh\necho 'BUILD SUCCESSFUL'\nexit 0\n", encoding="utf-8")
+        gradlew.chmod(0o755)
+
+        monkeypatch.setenv("LINC_PROJECTS_DIR", str(tmp_path / "projects"))
+        monkeypatch.setenv("FORGE_PROJECTS_FILE", str(tmp_path / "no-projects.yaml"))
+
+        reader = ForgeProjectReader()
+        local_scorer = QualityScorer(scores_dir=tmp_path / "scores")
+        assayer = Assayer(forge_reader=reader, scorer=local_scorer)
+
+        report = assayer.assay("GradleXmlApp", mode="quick")
+        payload = report.to_dict()
+        assert report.tests.total == 4
+        assert report.tests.passed == 3
+        assert report.tests.failed == 0
+        assert report.tests.skipped == 1
+        assert report.tests.success is True
+        assert report.tests.score_input == 0.75
+        assert payload["measured"] is True
+        assert payload["status"] == "measured"
+        assert report.quality_score is not None
+        assert report.quality_score.composite == 75.0
+        assert report.quality_score.ship_gate is False
+
+    @patch("subprocess.run")
+    def test_exit_zero_empty_output_with_green_lint_is_partial_and_blocks_gate(
+        self, mock_subprocess: MagicMock, mock_forge: MagicMock, scorer: QualityScorer
+    ) -> None:
+        """Exit 0 + 0 parsed tests + clean lint -> partial-unmeasured, ship_gate False."""
+        lint_result = MagicMock(returncode=0, stdout="All good", stderr="")
+        test_result = MagicMock(returncode=0, stdout="", stderr="")
+        mock_subprocess.side_effect = [lint_result, test_result]
+
+        assayer = Assayer(forge_reader=mock_forge, scorer=scorer)
+        report = assayer.assay("TestProject", mode="quick")
+
+        assert report.tests.total == 0
+        assert report.tests.success is False
+        assert report.tests.output == "UNMEASURED: exit 0 with 0 parsed tests"
+        assert report.tests.attempted_unmeasured is True
+        assert report.quality_score is not None
+        assert report.quality_score.ship_gate is False
+        assert report.quality_score.attempted_unmeasured == ["tests"]
+        payload = report.to_dict()
+        assert payload["status"] == "partial"
+        assert payload["tests"]["pass_rate"] is None
+
+    @patch("subprocess.run")
+    def test_nonzero_exit_with_stale_passing_junit_xml_is_unmeasured(
+        self, mock_subprocess: MagicMock, tmp_path: Path, scorer: QualityScorer
+    ) -> None:
+        """Exit 1 with stale passing XML (0 failures) contradicts exit code -> UNMEASURED."""
+        proj_dir = tmp_path / "broken-gradle"
+        xml_dir = proj_dir / "build" / "test-results" / "test"
+        xml_dir.mkdir(parents=True)
+        (xml_dir / "TEST-Old.xml").write_text(
+            '<testsuite tests="5" failures="0" errors="0" skipped="0"/>', encoding="utf-8"
+        )
+        forge = MagicMock(spec=ForgeProjectReader)
+        forge.get.return_value = ForgeProject(
+            name="BrokenGradle",
+            path=str(proj_dir),
+            test_command="./gradlew test",
+            framework="gradle_kmp",
+        )
+        mock_subprocess.return_value = MagicMock(
+            returncode=1, stdout="FAILURE: Build failed", stderr=""
+        )
+
+        assayer = Assayer(forge_reader=forge, scorer=scorer)
+        report = assayer.assay("BrokenGradle", mode="quick")
+
+        assert report.tests.total == 0
+        assert report.tests.success is False
+        assert report.tests.attempted_unmeasured is True
+        assert "UNMEASURED: exit 1" in report.tests.output
+        assert report.quality_score is not None
+        assert report.quality_score.ship_gate is False
+
+
+class TestGradleJUnitXmlParser:
+    """Direct unit tests for Gradle JUnit XML parsing helpers (CRAP + mutation coverage)."""
+
+    def test_parse_nonneg_int_cases(self) -> None:
+        from linc_crucible.core.assayer import _parse_nonneg_int
+
+        assert _parse_nonneg_int(None) == 0
+        assert _parse_nonneg_int("0") == 0
+        assert _parse_nonneg_int("7") == 7
+        assert _parse_nonneg_int("-3") == 0
+        assert _parse_nonneg_int("abc") == 0
+
+    def test_junit_parser_handles_testsuites_cdata_zero_and_errors(self) -> None:
+        from linc_crucible.core.assayer import _JUnitSuiteParser
+
+        parser = _JUnitSuiteParser()
+        parser.feed(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<testsuites tests="999">\n'
+            '  <testsuite name="Empty" tests="0" failures="2"/>\n'
+            '  <testsuite name="One" tests="5" failures="1" errors="1" skipped="1">\n'
+            '    <testcase name="t1"/>\n'
+            "    <system-out><![CDATA[<testsuite tests='99'/>]]></system-out>\n"
+            "  </testsuite>\n"
+            '  <testsuite name="Two" tests="3" failures="0" errors="0" skipped="0"/>\n'
+            "</testsuites>\n"
+        )
+        assert parser.total == 8
+        assert parser.failed == 2
+        assert parser.skipped == 1
+
+    def test_parse_gradle_junit_xml_prefers_xml_over_stdout_and_handles_edge_files(
+        self, tmp_path: Path
+    ) -> None:
+        from linc_crucible.core.assayer import _parse_gradle_junit_xml
+
+        assert _parse_gradle_junit_xml(None) == (0, 0, 0, 0)
+        assert _parse_gradle_junit_xml("") == (0, 0, 0, 0)
+        assert _parse_gradle_junit_xml(tmp_path / "missing") == (0, 0, 0, 0)
+
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        # Non-dir file, dot-dir, build dir, symlinked dir should all be ignored cleanly
+        (proj / "build.gradle").write_text("// gradle", encoding="utf-8")
+        hidden = proj / ".gradle" / "build" / "test-results"
+        hidden.mkdir(parents=True)
+        (hidden / "TEST-Hidden.xml").write_text('<testsuite tests="99"/>', encoding="utf-8")
+
+        root_build_nested = proj / "build" / "build" / "test-results"
+        root_build_nested.mkdir(parents=True)
+        (root_build_nested / "TEST-Ignored.xml").write_text(
+            '<testsuite tests="99"/>', encoding="utf-8"
+        )
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "TEST-Outside.xml").write_text('<testsuite tests="99"/>', encoding="utf-8")
+        (proj / "linked_mod").symlink_to(outside, target_is_directory=True)
+
+        root_res = proj / "build" / "test-results" / "test"
+        root_res.mkdir(parents=True)
+        (root_res / "TEST-Root.xml").write_text(
+            '<testsuite tests="4" failures="1" errors="0" skipped="1"/>', encoding="utf-8"
+        )
+        # Symlinked XML, directory named *.xml, and invalid UTF-8 XML are safely skipped
+        (root_res / "symlink.xml").symlink_to(outside / "TEST-Outside.xml")
+        (root_res / "subdir.xml").mkdir()
+        (root_res / "bad-utf8.xml").write_bytes(b"\xff\xfe<testsuite tests='50'/>")
+
+        mod_res = proj / "app" / "build" / "test-results" / "testDebug"
+        mod_res.mkdir(parents=True)
+        # Excess failures clamp passed at 0
+        (mod_res / "TEST-App.xml").write_text(
+            '<testsuite tests="2" failures="3" errors="1" skipped="0"/>', encoding="utf-8"
+        )
+
+        # total = 4 + 2 = 6; failed = 1 + 4 = 5; skipped = 1; passed = max(0, 6 - 5 - 1) = 0
+        assert _parse_test_results("Tests run: 1, Failures: 0, Errors: 0", "gradle_kmp", proj) == (
+            6,
+            0,
+            5,
+            1,
+        )
+        assert _parse_gradle_junit_xml(proj) == (6, 0, 5, 1)
+
+    def test_find_gradle_test_result_dirs_handles_iterdir_oserror(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from linc_crucible.core.assayer import _find_gradle_test_result_dirs
+
+        root_res = tmp_path / "build" / "test-results"
+        root_res.mkdir(parents=True)
+
+        orig_iterdir = Path.iterdir
+
+        def _broken_iterdir(self: Path):
+            if self == tmp_path:
+                raise PermissionError("denied")
+            return orig_iterdir(self)
+
+        monkeypatch.setattr(Path, "iterdir", _broken_iterdir)
+        assert _find_gradle_test_result_dirs(tmp_path) == [root_res]
+
+    def test_feed_junit_xml_bounds_and_oserror(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from linc_crucible.core.assayer import (
+            _MAX_JUNIT_XML_BYTES,
+            _feed_junit_xml,
+            _JUnitSuiteParser,
+        )
+
+        # Tag fits right up to _MAX_JUNIT_XML_BYTES -> parsed
+        tag = '<testsuite tests="2"/>'
+        exact_file = tmp_path / "exact.xml"
+        exact_file.write_text(" " * (_MAX_JUNIT_XML_BYTES - len(tag)) + tag, encoding="utf-8")
+        p1 = _JUnitSuiteParser()
+        _feed_junit_xml(exact_file, p1)
+        assert p1.total == 2
+
+        # Tag ends 1 byte past _MAX_JUNIT_XML_BYTES -> closing '>' truncated -> not counted
+        over_file = tmp_path / "over.xml"
+        over_file.write_text(" " * (_MAX_JUNIT_XML_BYTES - len(tag) + 1) + tag, encoding="utf-8")
+        p2 = _JUnitSuiteParser()
+        _feed_junit_xml(over_file, p2)
+        assert p2.total == 0
+
+        # OSError during open is skipped without raising
+        orig_open = Path.open
+
+        def _broken_open(self: Path, *args, **kwargs):
+            if self == exact_file:
+                raise PermissionError("unreadable")
+            return orig_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", _broken_open)
+        p3 = _JUnitSuiteParser()
+        _feed_junit_xml(exact_file, p3)
+        assert p3.total == 0
+
+
+def test_contract_stale_junit_xml_from_an_earlier_run_is_not_counted(tmp_path: Path) -> None:
+    """[contract] A JUnit XML file older than the current run (a previous run's leftover)
+    never counts toward this run: exit 0 with no parsed tests stays UNMEASURED, while XML
+    written during the run is counted."""
+    import os as _os
+    import subprocess as _subprocess
+    import time as _time
+
+    from linc_crucible.core.assayer import _build_test_run_result
+
+    res_dir = tmp_path / "build" / "test-results" / "test"
+    res_dir.mkdir(parents=True)
+    stale = res_dir / "TEST-Old.xml"
+    stale.write_text('<testsuite tests="40" failures="0" errors="0" skipped="0"/>', "utf-8")
+    hour_ago = _time.time() - 3600
+    _os.utime(stale, (hour_ago, hour_ago))
+
+    run = _subprocess.CompletedProcess(
+        ["./gradlew", "test"], 0, stdout="BUILD SUCCESSFUL\n", stderr=""
+    )
+    started = _time.time() - 2.0
+    stale_only = _build_test_run_result(run, "gradle_kmp", tmp_path, since=started)
+    assert stale_only.total == 0
+    assert stale_only.score_input is None
+    assert "UNMEASURED" in stale_only.output
+
+    (res_dir / "TEST-New.xml").write_text(
+        '<testsuite tests="3" failures="1" errors="0" skipped="0"/>', "utf-8"
+    )
+    fresh = _build_test_run_result(run, "gradle_kmp", tmp_path, since=started)
+    assert (fresh.total, fresh.failed) == (3, 1)
+
+
+def _xml(dirpath: Path, tests: int) -> None:
+    dirpath.mkdir(parents=True, exist_ok=True)
+    (dirpath / "TEST-X.xml").write_text(
+        f'<testsuite tests="{tests}" failures="0" errors="0" skipped="0"/>', "utf-8"
+    )
+
+
+def test_contract_junit_dirs_ignore_symlinked_results_and_subprojects(tmp_path: Path) -> None:
+    """[contract] a symlinked root or subproject build/test-results dir, and a symlinked
+    subproject whose target holds real results, are never counted; real dirs are."""
+    from linc_crucible.core.assayer import _parse_gradle_junit_xml
+
+    outside = tmp_path / "outside"
+    _xml(outside / "build" / "test-results" / "test", 50)
+    _xml(outside / "res", 70)
+
+    proj = tmp_path / "proj"
+    (proj / "build").mkdir(parents=True)
+    (proj / "build" / "test-results").symlink_to(outside / "res", target_is_directory=True)
+    (proj / "app" / "build").mkdir(parents=True)
+    (proj / "app" / "build" / "test-results").symlink_to(outside / "res", target_is_directory=True)
+    (proj / "linked").symlink_to(outside, target_is_directory=True)
+    assert _parse_gradle_junit_xml(proj) == (0, 0, 0, 0)
+
+    _xml(proj / "lib" / "build" / "test-results" / "test", 3)
+    assert _parse_gradle_junit_xml(proj) == (3, 3, 0, 0)
+
+
+def test_contract_run_tests_ignores_stale_junit_xml(tmp_path: Path, scorer: QualityScorer) -> None:
+    """[contract] Assayer._run_tests passes the run start to the XML reader: XML left over
+    from an earlier run does not count, so an exit-0 run printing no test summary is
+    UNMEASURED with zero counts and keeps the tool's own output after the prefix."""
+    import os as _os
+    import time as _time
+
+    res = tmp_path / "build" / "test-results" / "test"
+    _xml(res, 40)
+    old = _time.time() - 3600
+    _os.utime(res / "TEST-X.xml", (old, old))
+
+    project = ForgeProject(
+        name="Stale", path=str(tmp_path), test_command="./gradlew test", framework="gradle_kmp"
+    )
+    assayer = Assayer(forge_reader=MagicMock(spec=ForgeProjectReader), scorer=scorer)
+    done = subprocess.CompletedProcess(["./gradlew", "test"], 0, "BUILD SUCCESSFUL\n", "")
+    with patch("linc_crucible.core.assayer.safe_subprocess_run", return_value=done):
+        result = assayer._run_tests(project)
+
+    assert (result.total, result.passed, result.failed, result.skipped) == (0, 0, 0, 0)
+    assert result.success is False
+    assert result.score_input is None
+    assert result.output == "UNMEASURED: exit 0 with 0 parsed tests\nBUILD SUCCESSFUL\n"
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ("", (0, 0, 0, 0)),
+        ("nothing to see here", (0, 0, 0, 0)),
+        ("Tests run: 10, Failures: 2, Errors: 1, Skipped: 3", (10, 4, 3, 3)),
+        ("Tests run: 5, Failures: 1, Errors: 0", (5, 4, 1, 0)),
+        ("Tests run: 4, Failures: 0, Errors: 2", (4, 2, 2, 0)),
+        ("===== 1 passed in 0.01s =====", (1, 1, 0, 0)),
+    ],
+)
+def test_contract_parse_stdout_test_results_exact_counts(
+    output: str, expected: tuple[int, int, int, int]
+) -> None:
+    """[contract] exact (total, passed, failed, skipped) for each summary shape, including
+    errors counted as failures, a missing Skipped field and a single pytest test."""
+    from linc_crucible.core.assayer import _parse_stdout_test_results
+
+    assert _parse_stdout_test_results(output) == expected
+
+
+def test_contract_future_dated_junit_xml_is_ignored_and_unmeasured(
+    tmp_path: Path, scorer: QualityScorer
+) -> None:
+    """[contract] a passing XML with mtime in 2030 and a run that writes nothing -> UNMEASURED."""
+    import os as _os
+    from datetime import UTC, datetime
+
+    res = tmp_path / "build" / "test-results" / "test"
+    _xml(res, 40)
+    future_2030 = datetime(2030, 1, 1, tzinfo=UTC).timestamp()
+    _os.utime(res / "TEST-X.xml", (future_2030, future_2030))
+
+    project = ForgeProject(
+        name="FutureXml", path=str(tmp_path), test_command="./gradlew test", framework="gradle_kmp"
+    )
+    assayer = Assayer(forge_reader=MagicMock(spec=ForgeProjectReader), scorer=scorer)
+    done = subprocess.CompletedProcess(["./gradlew", "test"], 0, "BUILD SUCCESSFUL\n", "")
+    with patch("linc_crucible.core.assayer.safe_subprocess_run", return_value=done):
+        result = assayer._run_tests(project)
+
+    assert (result.total, result.passed, result.failed, result.skipped) == (0, 0, 0, 0)
+    assert result.success is False
+    assert result.score_input is None
+    assert result.output.startswith("UNMEASURED:")
+
+
+def test_contract_nested_module_junit_xml_is_counted(tmp_path: Path) -> None:
+    """[contract] results under feature/login/build/test-results/test/ are counted."""
+    from linc_crucible.core.assayer import _parse_gradle_junit_xml
+
+    proj = tmp_path / "proj"
+    nested = proj / "feature" / "login" / "build" / "test-results" / "test"
+    nested.mkdir(parents=True)
+    (nested / "TEST-Login.xml").write_text(
+        '<testsuite tests="4" failures="1" errors="0" skipped="1"/>', encoding="utf-8"
+    )
+
+    # Ignored paths: dot dirs at depth, build subtrees, and symlinks
+    _xml(proj / "feature" / ".hidden" / "build" / "test-results" / "test", 99)
+    _xml(proj / "feature" / "login" / "build" / "intermediates" / "build" / "test-results", 99)
+
+    outside = tmp_path / "outside"
+    _xml(outside / "build" / "test-results" / "test", 99)
+    _xml(outside / "test-results", 99)
+    (proj / "feature" / "linked").symlink_to(outside, target_is_directory=True)
+    (proj / "feature" / "badbuild").mkdir(parents=True)
+    (proj / "feature" / "badbuild" / "build").symlink_to(outside, target_is_directory=True)
+
+    assert _parse_gradle_junit_xml(proj) == (4, 2, 1, 1)
+
+
+def test_find_gradle_test_result_dirs_respects_max_dirs_cap(tmp_path: Path) -> None:
+    """[contract] The bounded walk raises instead of silently returning a partial list, and
+    handles max_dirs <= 0."""
+    from linc_crucible.core.assayer import _find_gradle_test_result_dirs
+
+    _xml(tmp_path / "a" / "build" / "test-results" / "test", 1)
+    _xml(tmp_path / "b" / "build" / "test-results" / "test", 2)
+    _xml(tmp_path / "a" / "deep" / "build" / "test-results" / "test", 3)
+
+    from linc_crucible.core.assayer import JUnitSearchTruncated
+
+    assert _find_gradle_test_result_dirs(tmp_path, max_dirs=0) == []
+    # Directories walked: root, a, b, a/deep (build/ subtrees are skipped) = 4.
+    assert len(_find_gradle_test_result_dirs(tmp_path, max_dirs=4)) == 3
+    with pytest.raises(JUnitSearchTruncated) as truncated:
+        _find_gradle_test_result_dirs(tmp_path, max_dirs=3)
+    assert truncated.value.args == (3,)
+
+    all_dirs = _find_gradle_test_result_dirs(tmp_path)
+    assert all_dirs == [
+        tmp_path / "a" / "build" / "test-results",
+        tmp_path / "b" / "build" / "test-results",
+        tmp_path / "a" / "deep" / "build" / "test-results",
+    ]
+
+
+def test_mtime_in_window_hostile_and_boundary_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[contract] Non-finite bounds/mtime and OSError fail closed; explicit until is enforced."""
+    import os as _os
+    import time as _time
+
+    from linc_crucible.core.assayer import _build_test_run_result, _mtime_in_window
+
+    xml = tmp_path / "build" / "test-results" / "test" / "TEST-X.xml"
+    xml.parent.mkdir(parents=True)
+    xml.write_text('<testsuite tests="3" failures="0" errors="0" skipped="0"/>', "utf-8")
+    now = _time.time()
+    _os.utime(xml, (now, now))
+
+    assert _mtime_in_window(tmp_path / "missing.xml", since=0.0) is False
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        assert _mtime_in_window(xml, since=bad) is False
+        assert _mtime_in_window(xml, until=bad) is False
+
+    assert _mtime_in_window(xml, since=now - 1, until=now + 1) is True
+    assert _mtime_in_window(xml, since=None, until=now - 10) is False
+
+    # _build_test_run_result with since only (no explicit until) still rejects 2030 XML
+    future = now + 100_000_000
+    _os.utime(xml, (future, future))
+    run = subprocess.CompletedProcess(
+        ["./gradlew", "test"], 0, stdout="BUILD SUCCESSFUL\n", stderr=""
+    )
+    res = _build_test_run_result(run, "gradle_kmp", tmp_path, since=now - 2.0)
+    assert res.total == 0
+    assert "UNMEASURED" in res.output
+
+    # Non-finite st_mtime fails closed
+    fake_stat = MagicMock(st_mtime=float("nan"))
+    monkeypatch.setattr(Path, "stat", lambda _self: fake_stat)
+    assert _mtime_in_window(xml, since=0.0, until=1e12) is False
+
+
+def test_contract_mtime_window_is_inclusive_at_both_ends(tmp_path: Path) -> None:
+    """[contract] a JUnit file whose mtime equals the window's start or end counts; one
+    second outside either end does not."""
+    import os as _os
+
+    from linc_crucible.core.assayer import _mtime_in_window
+
+    f = tmp_path / "TEST-x.xml"
+    f.write_text("<testsuite tests='1'/>")
+    _os.utime(f, (1_000_000.0, 1_000_000.0))
+    assert _mtime_in_window(f, since=1_000_000.0, until=1_000_000.0) is True
+    assert _mtime_in_window(f, since=999_000.0, until=1_000_000.0) is True
+    assert _mtime_in_window(f, since=1_000_000.0, until=2_000_000.0) is True
+    assert _mtime_in_window(f, since=1_000_001.0, until=2_000_000.0) is False
+    assert _mtime_in_window(f, since=999_000.0, until=999_999.0) is False
+    assert _mtime_in_window(f) is True
+
+
+def test_contract_node_modules_skipped_and_capped_search_is_unmeasured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[contract] source sets and vendored trees (src, node_modules, vendor, Pods) never count
+    toward the walk, so a project with a large dependency tree still finds
+    a failing module's results; a project too large for the walk is UNMEASURED rather than
+    scored on the modules it happened to reach."""
+    import time as _time
+
+    from linc_crucible.core import assayer as assayer_mod
+    from linc_crucible.core.assayer import _build_test_run_result
+
+    for skipped in ("node_modules", "vendor/bundle", "iosApp/Pods", "shared/src/commonMain"):
+        for i in range(30):
+            (tmp_path / skipped / f"pkg{i:02d}" / "lib").mkdir(parents=True)
+    (tmp_path / "shared" / "build.gradle.kts").write_text("", "utf-8")
+    _xml(tmp_path / "shared" / "core" / "build" / "test-results" / "test", 5)
+    (tmp_path / "shared" / "core" / "build" / "test-results" / "test" / "TEST-X.xml").write_text(
+        '<testsuite tests="5" failures="2" errors="0" skipped="0"/>', "utf-8"
+    )
+    run = subprocess.CompletedProcess(["./gradlew", "test"], 0, "BUILD SUCCESSFUL\n", "")
+    since = _time.time() - 5
+
+    monkeypatch.setattr(assayer_mod, "_MAX_GRADLE_WALK_DIRS", 10)
+    found = _build_test_run_result(run, "gradle_kmp", tmp_path, since=since)
+    assert (found.total, found.failed) == (5, 2)
+
+    for i in range(20):
+        (tmp_path / f"module{i:02d}").mkdir()
+    capped = _build_test_run_result(run, "gradle_kmp", tmp_path, since=since)
+    assert (capped.total, capped.failed, capped.success) == (0, 0, False)
+    assert capped.output == (
+        "UNMEASURED: test-results search stopped at 10 directories\nBUILD SUCCESSFUL\n"
+    )
+
+
+def test_contract_modules_under_vendor_or_src_are_still_walked(tmp_path: Path) -> None:
+    """[contract] only a module's own src source set (parent has build.gradle, src has none)
+    and vendor/bundle are skipped: a module included as :vendor:foo, one under a plain src/
+    directory, and a module that is itself named src still have their results counted."""
+    from linc_crucible.core.assayer import _find_gradle_test_result_dirs
+
+    _xml(tmp_path / "vendor" / "foo" / "build" / "test-results" / "test", 2)
+    _xml(tmp_path / "src" / "plugin" / "build" / "test-results" / "test", 3)
+    _xml(tmp_path / "app" / "src" / "build" / "test-results" / "test", 4)
+    (tmp_path / "app" / "build.gradle").write_text("", "utf-8")
+    _xml(tmp_path / "lib" / "src" / "build" / "test-results" / "test", 6)
+    (tmp_path / "lib" / "build.gradle.kts").write_text("", "utf-8")
+    (tmp_path / "lib" / "src" / "build.gradle.kts").write_text("", "utf-8")
+    _xml(tmp_path / "vendor" / "bundle" / "gem" / "build" / "test-results" / "test", 5)
+
+    found = _find_gradle_test_result_dirs(tmp_path)
+    assert found == [
+        tmp_path / "lib" / "src" / "build" / "test-results",
+        tmp_path / "src" / "plugin" / "build" / "test-results",
+        tmp_path / "vendor" / "foo" / "build" / "test-results",
+    ]

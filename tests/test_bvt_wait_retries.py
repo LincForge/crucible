@@ -360,3 +360,392 @@ def test_schema_docstring_documents_new_forms() -> None:
     doc = schema.__doc__ or ""
     assert "wait_for_element" in doc
     assert "retries" in doc
+
+
+# --- [contract] wait negative/non-finite & retry_backoff bounds (R4 finding 8) ---
+
+
+@pytest.mark.parametrize(
+    ("yaml_step", "expected_target"),
+    [
+        ("- wait: -1", "-1"),
+        ("- wait: -0.5", "-0.5"),
+        ("- wait: .nan", "nan"),
+        ("- wait: .inf", "inf"),
+        ("- wait: -.inf", "-inf"),
+        ("- wait: {duration: -1}", ""),
+        ("- wait: {duration: .nan}", ""),
+        ("- wait: {duration: .inf}", ""),
+    ],
+    ids=[
+        "yaml-neg-int",
+        "yaml-neg-float",
+        "yaml-nan",
+        "yaml-inf",
+        "yaml-neg-inf",
+        "yaml-dict-neg",
+        "yaml-dict-nan",
+        "yaml-dict-inf",
+    ],
+)
+def test_wait_negative_and_non_finite_yaml_steps_return_validation_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, yaml_step: str, expected_target: str
+) -> None:
+    """[contract] wait: -1 and wait: .nan return a validation error, not an exception."""
+    from linc_crucible.core.bvt.schema import load_bvt_dir
+
+    bvt_dir = tmp_path / ".bvt"
+    bvt_dir.mkdir()
+    (bvt_dir / "bad_wait.yaml").write_text(
+        f"package: com.example.app\ntests:\n  - name: bad_wait\n    steps:\n      {yaml_step}\n",
+        encoding="utf-8",
+    )
+    suite = load_bvt_dir(bvt_dir)
+    assert suite.tests[0].steps[0].target == expected_target
+
+    slept: list[float] = []
+    monkeypatch.setattr(step_handlers.time, "sleep", lambda s: slept.append(s))
+
+    mock = make_mock_nerve_client()
+    runner = _runner(mock, tmp_path)
+    monkeypatch.setattr(runner, "_reset_app", lambda *a, **k: None)
+
+    result = runner.run_suite(suite, device="DEV")
+    assert result.passed is False
+    assert result.total_failed == 1
+    assert result.total_harness_errors == 0
+    test_res = result.tests[0]
+    assert test_res.passed is False
+    assert test_res.harness_error is False
+    assert "validation" in test_res.failure_message.lower()
+    assert slept == []
+
+
+@pytest.mark.parametrize(
+    "step",
+    [
+        BVTStep(action="wait", target="-1"),
+        BVTStep(action="wait", target="-1s"),
+        BVTStep(action="wait", target=" -1s "),
+        BVTStep(action="wait", target="-500ms"),
+        BVTStep(action="wait", target="nan"),
+        BVTStep(action="wait", target=".nan"),
+        BVTStep(action="wait", target=" .nan "),
+        BVTStep(action="wait", target=".inf"),
+        BVTStep(action="wait", target="+.inf"),
+        BVTStep(action="wait", target="-.inf"),
+        BVTStep(action="wait", target="inf"),
+        BVTStep(action="wait", target="-inf"),
+        BVTStep(action="wait", target="", params={"duration": -1}),
+        BVTStep(action="wait", target="", params={"duration": float("nan")}),
+        BVTStep(action="wait", target="", params={"duration": float("inf")}),
+        BVTStep(action="wait", target="", params={"duration": float("-inf")}),
+        BVTStep(action="wait", target="", params={"duration": False}),
+        BVTStep(action="wait", target="", params={"duration": True}),
+    ],
+    ids=[
+        "str-neg",
+        "str-neg-s",
+        "str-neg-s-ws",
+        "str-neg-ms",
+        "str-nan",
+        "str-dot-nan",
+        "str-dot-nan-ws",
+        "str-dot-inf",
+        "str-plus-dot-inf",
+        "str-minus-dot-inf",
+        "str-inf",
+        "str-neg-inf",
+        "param-neg",
+        "param-nan",
+        "param-inf",
+        "param-neg-inf",
+        "param-false",
+        "param-true",
+    ],
+)
+def test_do_wait_rejects_negative_non_finite_and_bool_without_sleeping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, step: BVTStep
+) -> None:
+    """[contract] _do_wait returns a step validation error instead of raising from time.sleep."""
+    slept: list[float] = []
+    monkeypatch.setattr(step_handlers.time, "sleep", lambda s: slept.append(s))
+
+    runner = _runner(make_mock_nerve_client(), tmp_path)
+    res = runner._do_wait(step, "DEV", "pkg", "t")
+    assert res.action == "wait"
+    assert res.passed is False
+    assert res.harness_error is False
+    assert "validation" in res.message.lower()
+    assert slept == []
+
+
+@pytest.mark.parametrize("raw_backoff", [86400, "86400s", 999.0, 1e308])
+def test_retry_backoff_large_value_is_clamped_to_wait_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw_backoff: object
+) -> None:
+    """[contract] retry_backoff: 86400 is clamped to _WAIT_MAX_S so effective sleep is bounded."""
+    runner = _runner(make_mock_nerve_client(), tmp_path)
+    _stub_step_executor(runner, monkeypatch, [False, True])
+    slept: list[float] = []
+    monkeypatch.setattr(step_handlers.time, "sleep", lambda s: slept.append(s))
+    warned: list[tuple] = []
+    monkeypatch.setattr(step_handlers.log, "warning", lambda *a, **k: warned.append((a, k)))
+
+    step = BVTStep(
+        action="tap",
+        target="btn",
+        params={"retries": 1, "retry_backoff": raw_backoff},
+    )
+    res = runner._execute_step_with_retries(step, "DEV", "pkg", "t")
+    assert res.passed is True
+    assert slept == [step_handlers._WAIT_MAX_S]
+    assert slept[0] <= step_handlers._WAIT_MAX_S
+    assert any(a[0] == "bvt_duration_clamped" for a, _ in warned)
+
+
+@pytest.mark.parametrize(
+    "bad_backoff",
+    [
+        -1,
+        -0.5,
+        "-1",
+        "-1s",
+        "-500ms",
+        float("nan"),
+        "nan",
+        ".nan",
+        float("inf"),
+        float("-inf"),
+        "inf",
+        "-inf",
+        True,
+        False,
+    ],
+    ids=[
+        "neg-int",
+        "neg-float",
+        "str-neg",
+        "str-neg-s",
+        "str-neg-ms",
+        "nan",
+        "str-nan",
+        "str-dot-nan",
+        "inf",
+        "neg-inf",
+        "str-inf",
+        "str-neg-inf",
+        "bool-true",
+        "bool-false",
+    ],
+)
+def test_retry_backoff_rejects_negative_non_finite_and_bool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad_backoff: object
+) -> None:
+    """[contract] negative/non-finite/bool retry_backoff returns validation error without sleep."""
+    runner = _runner(make_mock_nerve_client(), tmp_path)
+    calls = {"n": 0}
+
+    def fail_if_called(*_a, **_k):
+        calls["n"] += 1
+        return BVTStepResult(action="tap", passed=True)
+
+    monkeypatch.setattr(runner, "_execute_step", fail_if_called)
+    slept: list[float] = []
+    monkeypatch.setattr(step_handlers.time, "sleep", lambda s: slept.append(s))
+
+    step = BVTStep(
+        action="tap",
+        target="btn",
+        params={"retries": 1, "retry_backoff": bad_backoff},
+    )
+    res = runner._execute_step_with_retries(step, "DEV", "pkg", "t")
+    assert res.passed is False
+    assert res.harness_error is False
+    assert "validation" in res.message.lower()
+    assert calls["n"] == 0
+    assert slept == []
+
+
+def test_wait_and_retry_backoff_zero_are_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Zero duration is finite and non-negative and remains accepted."""
+    slept: list[float] = []
+    monkeypatch.setattr(step_handlers.time, "sleep", lambda s: slept.append(s))
+    runner = _runner(make_mock_nerve_client(), tmp_path)
+
+    wait_res = runner._do_wait(
+        BVTStep(action="wait", target="", params={"duration": 0}), "D", "p", "t"
+    )
+    assert wait_res.passed is True
+    assert slept == [0.0]
+
+    slept.clear()
+    _stub_step_executor(runner, monkeypatch, [False, True])
+    retry_res = runner._execute_step_with_retries(
+        BVTStep(action="tap", target="btn", params={"retries": 1, "retry_backoff": 0}),
+        "D",
+        "p",
+        "t",
+    )
+    assert retry_res.passed is True
+    assert slept == [0.0]
+
+
+def test_validated_duration_fallback_for_non_numeric_and_non_str(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Non-numeric strings and non-str objects fall back to default via _duration_seconds."""
+    warned: list[tuple] = []
+    monkeypatch.setattr(step_handlers.log, "warning", lambda *a, **k: warned.append((a, k)))
+    assert (
+        step_handlers._validated_duration_seconds(
+            "not-a-duration", 2.5, what="wait.duration", maximum=120.0
+        )
+        == 2.5
+    )
+    assert (
+        step_handlers._validated_duration_seconds(
+            ["bad"], 2.5, what="wait.duration", maximum=120.0
+        )
+        == 2.5
+    )
+    assert len(warned) == 2
+
+    # Also verify real time.sleep (not stubbed) is never called and never raises on invalid wait.
+    import time as real_time
+
+    monkeypatch.setattr(step_handlers.time, "sleep", real_time.sleep)
+    runner = _runner(make_mock_nerve_client(), tmp_path)
+    for step in (
+        BVTStep(action="wait", target="-1"),
+        BVTStep(action="wait", target="nan"),
+    ):
+        res = runner._do_wait(step, "DEV", "pkg", "t")
+        assert res.passed is False
+        assert "validation" in res.message.lower()
+
+
+def test_contract_wait_default_is_one_second_and_errors_name_the_field(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """[contract] a bare `wait` sleeps exactly the 1.0 s default; a rejected duration names
+    `wait.duration`; a boolean duration has its own exact message."""
+    slept: list[float] = []
+    monkeypatch.setattr(step_handlers.time, "sleep", slept.append)
+    runner = _runner(make_mock_nerve_client(), tmp_path)
+
+    ok = runner._do_wait(BVTStep(action="wait"), "DEV", "pkg", "t")
+    assert ok.passed
+    assert slept == [1.0]
+    assert ok.message == "Waited 1.0s"
+
+    bad = runner._do_wait(BVTStep(action="wait", target="-1s"), "DEV", "pkg", "t")
+    assert not bad.passed
+    assert bad.message.startswith(
+        "validation error: wait.duration must be finite and non-negative"
+    )
+
+    with pytest.raises(ValueError) as exc:
+        step_handlers._parse_numeric_duration(True)
+    assert str(exc.value) == "validation error: duration must not be a boolean"
+
+
+def test_contract_parse_numeric_duration_sentinels() -> None:
+    """[contract] a negative duration string maps to exactly -1.0 and a YAML non-finite
+    token to NaN, so the caller's finite/non-negative check rejects both."""
+    import math
+
+    assert step_handlers._parse_numeric_duration("-5s") == -1.0
+    assert step_handlers._parse_numeric_duration(" -250ms ") == -1.0
+    assert math.isnan(step_handlers._parse_numeric_duration(".inf"))
+    assert step_handlers._parse_numeric_duration("2") == 2.0
+    assert step_handlers._parse_numeric_duration("soon") is None
+
+
+def test_contract_huge_retry_backoff_int_fails_step_and_preserves_suite_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[contract] retry_backoff: 1 followed by 400 zeros fails that step with the
+    non-finite validation message and the suite's other results are still returned."""
+    from linc_crucible.core.bvt.schema import load_bvt_dir
+
+    huge_backoff_str = "1" + ("0" * 400)
+    huge_backoff = int(huge_backoff_str)
+
+    bvt_dir = tmp_path / ".bvt"
+    bvt_dir.mkdir()
+    (bvt_dir / "huge_backoff.yaml").write_text(
+        "package: com.example.app\n"
+        "tests:\n"
+        "  - name: t1_before\n"
+        "    steps:\n"
+        "      - wait: 0s\n"
+        "  - name: t2_huge_backoff\n"
+        "    steps:\n"
+        "      - action: tap\n"
+        "        target: btn\n"
+        "        params:\n"
+        "          retries: 1\n"
+        f"          retry_backoff: {huge_backoff_str}\n"
+        "      - wait: 0s\n"
+        "  - name: t3_after\n"
+        "    steps:\n"
+        "      - wait: 0s\n",
+        encoding="utf-8",
+    )
+    suite = load_bvt_dir(bvt_dir)
+    assert suite.tests[1].steps[0].params["retry_backoff"] == huge_backoff
+
+    slept: list[float] = []
+    monkeypatch.setattr(step_handlers.time, "sleep", slept.append)
+
+    mock = make_mock_nerve_client()
+    runner = _runner(mock, tmp_path)
+    monkeypatch.setattr(runner, "_reset_app", lambda *a, **k: None)
+
+    result = runner.run_suite(suite, device="DEV")
+    assert result.passed is False
+    assert result.total_run == 3
+    assert result.total_passed == 2
+    assert result.total_failed == 1
+    assert result.total_harness_errors == 0
+    assert [t.name for t in result.tests] == ["t1_before", "t2_huge_backoff", "t3_after"]
+    assert result.tests[0].passed is True
+    assert result.tests[2].passed is True
+
+    failed = result.tests[1]
+    assert failed.passed is False
+    assert failed.harness_error is False
+    assert failed.steps_run == 1
+    assert failed.steps_passed == 0
+    assert failed.failure_message == (
+        "Step 1 'tap:btn' failed: validation error: retry_backoff must be finite "
+        f"and non-negative (got {huge_backoff!r})"
+    )
+    assert slept == [0.0, 0.0]
+
+
+def test_contract_parse_numeric_duration_overflow_int_returns_nan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[contract] OverflowError ints map to NaN and fail wait.duration validation."""
+    import math
+
+    huge = int("1" + ("0" * 400))
+    assert math.isnan(step_handlers._parse_numeric_duration(huge))
+    assert math.isnan(step_handlers._parse_numeric_duration(-huge))
+
+    slept: list[float] = []
+    monkeypatch.setattr(step_handlers.time, "sleep", slept.append)
+    runner = _runner(make_mock_nerve_client(), tmp_path)
+    step = BVTStep(action="wait", target="", params={"duration": huge})
+    res = runner._do_wait(step, "D", "p", "t")
+    assert res.action == "wait"
+    assert res.passed is False
+    assert res.harness_error is False
+    assert res.message == (
+        f"validation error: wait.duration must be finite and non-negative (got {huge!r})"
+    )
+    assert slept == []

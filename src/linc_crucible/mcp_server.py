@@ -1,6 +1,6 @@
 """MCP server for Linc Crucible — Claude Code integration.
 
-Exposes crucible tools via FastMCP for device fleet management,
+Exposes crucible tools via the mcp SDK's MCPServer for device fleet management,
 deployment, quality assurance, and scoring from within Claude Code.
 
 Start with: ``crucible bellows``

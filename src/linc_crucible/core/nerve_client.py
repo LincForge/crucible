@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Callable
 from typing import TypeVar
@@ -12,6 +13,54 @@ import structlog
 logger = structlog.get_logger().bind(domain="nerve_client")
 
 _T = TypeVar("_T")
+
+# Mirrors _RESERVATION_EXEMPT_TOOLS in linc-nerve src/linc_nerve/daemon/http_router.py:
+# tools that bypass nerve's router-level reservation fence and must never receive a
+# synthetic "owner" key from NerveClient._call_tool.
+_RESERVATION_EXEMPT_TOOLS = frozenset(
+    {
+        "nerve_reserve",
+        "nerve_release",
+        "nerve_pool",
+        "nerve_discover",
+        "nerve_record_stop",
+        "nerve_stream_stop",
+    }
+)
+
+_OWNER_RE = re.compile(r"\A[\x21-\x7e]{1,128}\Z")
+
+
+def validate_owner(owner: object) -> str:
+    """Validate and normalize an optional nerve lease owner string.
+
+    Args:
+        owner: Raw owner value (empty string means no owner).
+
+    Returns:
+        Stripped owner string, or ``""`` when empty.
+
+    Raises:
+        ValueError: If ``owner`` is not a ``str`` or, once stripped, is not
+            1..128 printable non-whitespace ASCII characters.
+    """
+    if not isinstance(owner, str):
+        raise ValueError("owner must be a string")
+    stripped = owner.strip()
+    if stripped and not _OWNER_RE.fullmatch(stripped):
+        raise ValueError("owner must be 1..128 printable ASCII characters without whitespace")
+    return stripped
+
+
+def _tool_body(tool: str, params: dict, owner: str) -> dict:
+    """Build the JSON request body for ``tool``, adding ``owner`` when fenced.
+
+    Never mutates ``params`` and never sends ``owner`` to an exempt tool.
+    """
+    if owner and tool not in _RESERVATION_EXEMPT_TOOLS:
+        return {**params, "owner": owner}
+    return dict(params)
+
 
 # Transient connection errors worth retrying on a cold first call. The nerve
 # daemon intermittently drops the first keep-alive connection in a burst
@@ -41,9 +90,9 @@ class UiTreeUnavailableError(RuntimeError):
 def find_reservation(reservations: list[dict], serial: str) -> dict | None:
     """Return the active reservation entry for *serial* in a nerve_pool payload, or None.
 
-    Any reservation on the device blocks it — there is no override and no
-    correlation against the caller's own session (owner/session-token
-    passthrough is handled by linc-nerve).
+    Callers inspect the returned entry's ``owner`` and forward their lease
+    owner through ``NerveClient(owner=...)`` or ``NerveClient.with_owner(...)``
+    so the caller's own reservation is honoured while foreign leases are refused.
     """
     for reservation in reservations or []:
         if reservation.get("device_serial") == serial:
@@ -60,11 +109,24 @@ class NerveClient:
         *,
         max_retries: int = 3,
         retry_backoff: float = 0.25,
+        owner: str = "",
     ) -> None:
         self._base_url = base_url
         self._http = httpx.Client(trust_env=False)
         self._max_retries = max(1, max_retries)
         self._retry_backoff = retry_backoff
+        self._owner = validate_owner(owner)
+
+    def with_owner(self, owner: str) -> NerveClient:
+        """Return a new NerveClient bound to ``owner`` sharing this client's HTTP pool."""
+        validated = validate_owner(owner)
+        clone = type(self).__new__(type(self))
+        clone._base_url = self._base_url
+        clone._http = self._http
+        clone._max_retries = self._max_retries
+        clone._retry_backoff = self._retry_backoff
+        clone._owner = validated
+        return clone
 
     def _with_retry(self, call: str, fn: Callable[[], _T]) -> _T:
         """Run ``fn``, retrying transient cold-connection resets.
@@ -98,7 +160,7 @@ class NerveClient:
         try:
             resp = self._http.post(
                 f"{self._base_url}/tools/{tool}",
-                json=params,
+                json=_tool_body(tool, params, self._owner),
                 timeout=timeout,
             )
             resp.raise_for_status()
@@ -128,7 +190,7 @@ class NerveClient:
         """
         return self._call_tool("nerve_install", {"device": device, "path": path}, timeout=120)
 
-    def launch(self, device: str, package: str, uri: str = "") -> dict:
+    def launch(self, device: str, package: str, uri: str = "", activity: str = "") -> dict:
         """Call nerve_launch, retrying transient cold-connection resets.
 
         The first launch in a BVT burst can hit a reset-by-peer before the
@@ -139,7 +201,9 @@ class NerveClient:
         """
         return self._with_retry(
             "launch",
-            lambda: self._call_tool("nerve_launch", _launch_params(device, package, uri)),
+            lambda: self._call_tool(
+                "nerve_launch", _launch_params(device, package, uri, activity)
+            ),
         )
 
     def kill(self, device: str, package: str) -> dict:
@@ -372,9 +436,11 @@ class NerveClient:
             return False
 
 
-def _launch_params(device: str, package: str, uri: str) -> dict[str, str]:
-    """Build the nerve_launch request payload, including uri only when non-empty."""
+def _launch_params(device: str, package: str, uri: str, activity: str = "") -> dict[str, str]:
+    """Build the nerve_launch request payload; uri and activity only when non-empty."""
     params: dict[str, str] = {"device": device, "package": package}
     if uri:
         params["uri"] = uri
+    if activity:
+        params["activity"] = activity
     return params

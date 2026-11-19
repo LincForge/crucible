@@ -90,6 +90,7 @@ def foreground_failure_message(
     polls: int,
     last_seen: str | None,
     last_error: str | None,
+    elements_error: str | None = None,
 ) -> str:
     """Build ``_wait_for_foreground``'s failure text.
 
@@ -99,20 +100,26 @@ def foreground_failure_message(
         was reported. Crucible never authors "daemon unreachable" here — that
         phrase can only appear if it's nerve's own error text.
       * a readable-but-wrong foreground — the normal "did not foreground".
+
+    When nerve also reported an ``elements_error`` note (e.g. iOS's standing
+    "element tree not collected by nerve_state on iOS; call nerve_elements"),
+    it is appended only labelled as ``(element tree: <note>)`` and never
+    attributed as the nerve error.
     """
+    note = f" (element tree: {elements_error})" if elements_error else ""
     if last_seen is None:
         if last_error:
             return (
                 f"could not read foreground for {device} after {window_s}s "
                 f"({polls} polls) — last nerve error: {last_error} "
-                f"(launched {target_package})"
+                f"(launched {target_package}){note}"
             )
         return (
             f"could not read foreground for {device} after {window_s}s "
             f"({polls} polls) — nerve_state returned no foreground and no "
-            f"error (launched {target_package})"
+            f"error (launched {target_package}){note}"
         )
     return (
         f"app did not foreground: launched {target_package}, foreground is "
-        f"{last_seen} after {window_s}s ({polls} polls)"
+        f"{last_seen} after {window_s}s ({polls} polls){note}"
     )

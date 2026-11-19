@@ -34,6 +34,10 @@ def test_test_matrix_is_ubuntu_and_macos_on_python_313_only() -> None:
     assert "uv run pytest -q -x" in runs
 
 
+def test_test_workflow_permissions_contents_read() -> None:
+    assert _wf("test.yml")["permissions"] == {"contents": "read"}
+
+
 def test_release_uses_trusted_publishing_no_token() -> None:
     rel = _wf("release.yml")
     job = next(iter(rel["jobs"].values()))

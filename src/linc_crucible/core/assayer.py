@@ -6,10 +6,14 @@ an ``AssayReport`` with quality scores and ship gate status.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import subprocess
+import time
+from collections import deque
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -104,15 +108,11 @@ class RunResult:
     def score_input(self) -> float | None:
         """Test pass rate for scoring, or None when nothing was measured.
 
-        None when: no test command was configured at all (`configured` is
-        False), OR the run produced zero parseable results AND did not exit
-        cleanly (`total == 0` and `success` is False — a build break, a
-        collection error, or unparseable output). A genuinely empty-but-green
-        suite (`total == 0`, `success` is True) is a SEPARATE, deliberate
-        case: it still scores the vacuous `pass_rate` of 1.0 rather than
-        being lumped in with a crash.
+        None when no test command was configured (`configured` is False), or
+        the run produced zero parseable tests (`total == 0`, regardless of
+        exit code — an exit-0 run with 0 parsed tests measured nothing).
         """
-        if not self.configured or (self.total == 0 and not self.success):
+        if not self.configured or self.total == 0:
             return None
         return self.pass_rate
 
@@ -519,9 +519,19 @@ class Assayer:
         if not test_cmd:
             return _missing_test_result(project)
 
+        # JUnit XML outside [started, ended] belongs to another run, never this one.
+        started = time.time() - _XML_MTIME_SLACK_S
         try:
             result = safe_subprocess_run(test_cmd, cwd=project.path, timeout=300)
-            return _build_test_run_result(result, project.framework)
+            ended = time.time() + _XML_MTIME_SLACK_S
+            run = _build_test_run_result(
+                result,
+                project.framework,
+                project.path,
+                since=started,
+                until=ended,
+            )
+            return run
         except (
             subprocess.TimeoutExpired,
             OSError,
@@ -908,23 +918,40 @@ def _exit_contradicts_summary(returncode: int, total: int, failed: int) -> bool:
     return returncode != 0 and failed == 0
 
 
-def _build_test_run_result(result: Any, framework: str) -> RunResult:
+def _unmeasured_test_result(prefix: str, output: str) -> RunResult:
+    """Build an unmeasured RunResult with an explicit UNMEASURED prefix."""
+    unmeasured_output = f"{prefix}\n{output}" if output else prefix
+    # Counts stay at RunResult's zero defaults: nothing was measured.
+    return RunResult(output=trim_output(unmeasured_output), success=False, attempted=True)
+
+
+def _build_test_run_result(
+    result: Any,
+    framework: str,
+    project_path: str | Path | None = None,
+    *,
+    since: float | None = None,
+    until: float | None = None,
+) -> RunResult:
     """Build RunResult from completed subprocess test run and framework."""
+    if since is not None and until is None:
+        until = time.time() + _XML_MTIME_SLACK_S
     output = result.stdout + result.stderr
-    total, passed, failed, skipped = _parse_test_results(output, framework)
+    try:
+        total, passed, failed, skipped = _parse_test_results(
+            output, framework, project_path=project_path, since=since, until=until
+        )
+    except JUnitSearchTruncated as exc:
+        return _unmeasured_test_result(
+            f"UNMEASURED: test-results search stopped at {exc.args[0]} directories", output
+        )
 
     if _exit_contradicts_summary(result.returncode, total, failed):
         prefix = f"UNMEASURED: exit {result.returncode} with no parsed failures"
-        unmeasured_output = f"{prefix}\n{output}" if output else prefix
-        return RunResult(
-            total=0,
-            passed=0,
-            failed=0,
-            skipped=0,
-            output=trim_output(unmeasured_output),
-            success=False,
-            attempted=True,
-        )
+        return _unmeasured_test_result(prefix, output)
+
+    if total == 0:
+        return _unmeasured_test_result("UNMEASURED: exit 0 with 0 parsed tests", output)
 
     return RunResult(
         total=total,
@@ -965,11 +992,186 @@ def _pytest_counts(output: str) -> tuple[int, int, int, int]:
     return (total, passed, failed, skipped)
 
 
-def _parse_test_results(output: str, framework: str) -> tuple:
-    """Parse test results from output.
+_MAX_JUNIT_XML_BYTES = 1_048_576
+_MAX_GRADLE_WALK_DIRS = 5_000
+# Child directories that never hold a Gradle module's build/test-results: build output
+# and npm / CocoaPods dependency trees. Two more are skipped: Ruby bundler's
+# ``vendor/bundle``, and the ``src`` source-set directory of a module (its parent has a
+# build.gradle file) unless that ``src`` is itself a module (has its own build file).
+# Any other ``vendor`` or ``src`` dir is walked (``include(":vendor:foo")``). Known
+# limit: a module nested deeper inside a module's source-set directory is not found.
+_NON_GRADLE_DIRS = frozenset({"build", "node_modules", "Pods"})
+_GRADLE_BUILD_FILES = ("build.gradle", "build.gradle.kts")
+# Filesystem mtime granularity allowance when comparing XML mtimes to the run window.
+_XML_MTIME_SLACK_S = 2.0
 
-    Returns (total, passed, failed, skipped).
+
+def _parse_nonneg_int(value: str | None) -> int:
+    """Parse a non-negative integer attribute, returning 0 on missing or invalid input."""
+    if value is None:
+        return 0
+    try:
+        return max(0, int(value))
+    except ValueError:
+        return 0
+
+
+class _JUnitSuiteParser(HTMLParser):
+    """Minimal non-expanding parser summing ``<testsuite>`` attributes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.total = 0
+        self.failed = 0
+        self.skipped = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "testsuite":
+            return
+        attr_map = dict(attrs)
+        tests = _parse_nonneg_int(attr_map.get("tests"))
+        if tests == 0:
+            return
+        self.total += tests
+        self.failed += _parse_nonneg_int(attr_map.get("failures"))
+        self.failed += _parse_nonneg_int(attr_map.get("errors"))
+        self.skipped += _parse_nonneg_int(attr_map.get("skipped"))
+
+
+def _valid_test_results_dir(parent: Path) -> Path | None:
+    """Return ``parent/build/test-results`` when neither directory is a symlink."""
+    build_dir = parent / "build"
+    if build_dir.is_symlink() or not build_dir.is_dir():
+        return None
+    results_dir = build_dir / "test-results"
+    if results_dir.is_symlink() or not results_dir.is_dir():
+        return None
+    return results_dir
+
+
+def _is_gradle_module(directory: Path) -> bool:
+    """Return True when *directory* holds a ``build.gradle`` or ``build.gradle.kts``."""
+    return any((directory / name).is_file() for name in _GRADLE_BUILD_FILES)
+
+
+def _iter_subproject_dirs(directory: Path) -> list[Path]:
+    """Return sorted child directories that can hold a Gradle module's test results."""
+    try:
+        entries = sorted(directory.iterdir(), key=lambda p: p.name)
+    except OSError:
+        return []
+    is_module = _is_gradle_module(directory)
+    in_vendor = directory.name == "vendor"
+    return [
+        entry
+        for entry in entries
+        if not entry.name.startswith(".")
+        and entry.name not in _NON_GRADLE_DIRS
+        and not (is_module and entry.name == "src" and not _is_gradle_module(entry))
+        and not (in_vendor and entry.name == "bundle")
+        and not entry.is_symlink()
+        and entry.is_dir()
+    ]
+
+
+class JUnitSearchTruncated(Exception):
+    """The bounded walk for ``build/test-results`` stopped before covering the project."""
+
+
+def _find_gradle_test_result_dirs(
+    project_path: Path, *, max_dirs: int | None = None
+) -> list[Path]:
+    """Find ``build/test-results`` dirs at any depth via a bounded breadth-first walk.
+
+    Skips dot directories, ``build`` subtrees (other than ``build/test-results``), a
+    module's ``src`` source sets, dependency trees (``node_modules``, ``Pods``,
+    ``vendor/bundle``) and symlinks. Raises ``JUnitSearchTruncated`` when the project has
+    more directories than ``max_dirs``: a partial search could silently drop a failing
+    module, so the caller must treat the run as unmeasured.
     """
+    if max_dirs is None:
+        max_dirs = _MAX_GRADLE_WALK_DIRS
+    if max_dirs <= 0:
+        return []
+    dirs: list[Path] = []
+    queue: deque[Path] = deque([project_path])
+    visited = 0
+    while queue:
+        current = queue.popleft()
+        visited += 1
+        results_dir = _valid_test_results_dir(current)
+        if results_dir is not None:
+            dirs.append(results_dir)
+        children = _iter_subproject_dirs(current)
+        if visited + len(queue) + len(children) > max_dirs:
+            raise JUnitSearchTruncated(max_dirs)
+        queue.extend(children)
+    return dirs
+
+
+def _mtime_in_window(
+    xml_path: Path, since: float | None = None, until: float | None = None
+) -> bool:
+    """Return True when ``xml_path`` mtime falls within ``[since, until]`` (inclusive)."""
+    if since is None and until is None:
+        return True
+    try:
+        mtime = xml_path.stat().st_mtime
+    except OSError:
+        return False
+    if not math.isfinite(mtime):
+        return False
+    if since is not None and (not math.isfinite(since) or mtime < since):
+        return False
+    return until is None or (math.isfinite(until) and mtime <= until)
+
+
+def _feed_junit_xml(
+    xml_path: Path,
+    parser: _JUnitSuiteParser,
+    since: float | None = None,
+    until: float | None = None,
+) -> None:
+    """Feed one non-symlink JUnit XML file (up to _MAX_JUNIT_XML_BYTES) into ``parser``.
+
+    With ``since`` / ``until``, files modified outside ``[since, until]`` are skipped.
+    """
+    if xml_path.is_symlink() or not xml_path.is_file():
+        return
+    if not _mtime_in_window(xml_path, since, until):
+        return
+    try:
+        with xml_path.open("r", encoding="utf-8") as fh:
+            content = fh.read(_MAX_JUNIT_XML_BYTES)
+    except (OSError, UnicodeDecodeError):
+        return
+    parser.feed(content)
+
+
+def _parse_gradle_junit_xml(
+    project_path: str | Path | None,
+    since: float | None = None,
+    until: float | None = None,
+) -> tuple[int, int, int, int]:
+    """Read Gradle JUnit XML test counts under ``**/build/test-results/`` if present.
+
+    With ``since`` / ``until``, only XML files modified in ``[since, until]`` count.
+    """
+    if not project_path:
+        return (0, 0, 0, 0)
+    root = Path(project_path)
+    if not root.is_dir():
+        return (0, 0, 0, 0)
+    parser = _JUnitSuiteParser()
+    for results_dir in _find_gradle_test_result_dirs(root):
+        for xml_path in results_dir.rglob("*.xml"):
+            _feed_junit_xml(xml_path, parser, since, until)
+    passed = max(0, parser.total - parser.failed - parser.skipped)
+    return (parser.total, passed, parser.failed, parser.skipped)
+
+
+def _parse_stdout_test_results(output: str) -> tuple[int, int, int, int]:
+    """Parse test counts from command stdout/stderr output."""
     if not output:
         return (0, 0, 0, 0)
 
@@ -1001,6 +1203,24 @@ def _parse_test_results(output: str, framework: str) -> tuple:
         return counts
 
     return (0, 0, 0, 0)
+
+
+def _parse_test_results(
+    output: str,
+    framework: str,
+    project_path: str | Path | None = None,
+    since: float | None = None,
+    until: float | None = None,
+) -> tuple[int, int, int, int]:
+    """Parse test results, checking Gradle JUnit XML first when available.
+
+    With ``since`` / ``until``, XML modified outside ``[since, until]`` is ignored.
+    Returns (total, passed, failed, skipped).
+    """
+    xml_counts = _parse_gradle_junit_xml(project_path, since, until)
+    if xml_counts[0] > 0:
+        return xml_counts
+    return _parse_stdout_test_results(output)
 
 
 def _resolve_commit_sha(project_path: str | Path | None) -> str | None:

@@ -42,6 +42,21 @@ TOOL_HINTS: dict[str, str] = {
     "xcrun": "Xcode command-line tools, needed for iOS builds",
     "ruff": "used by assay when a project's lint command calls it",
     "pytest": "used by assay when a project's test command calls it",
+    "aapt2": (
+        "Android SDK build-tools binary; without it `crucible apk-audit` cannot inspect "
+        "AndroidManifest.xml and reports unmeasured — install Android SDK Build-Tools and "
+        "set ANDROID_HOME or add to PATH"
+    ),
+    "apksigner": (
+        "Android SDK build-tools binary; without it `crucible apk-audit` cannot verify "
+        "APK signing certificates and reports unmeasured — install Android SDK Build-Tools "
+        "and set ANDROID_HOME or add to PATH"
+    ),
+}
+
+_TOOL_ABSENT_STATUS: dict[str, str] = {
+    "aapt2": "warn",
+    "apksigner": "warn",
 }
 
 NERVE_DOWN_HINT = (
@@ -113,10 +128,11 @@ def probe_install(check_install: Callable[[], str | None]) -> Probe:
 
 
 def probe_tool(name: str, which: Callable[[str], str | None]) -> Probe:
-    """``ok`` with the resolved path, else ``skip`` naming what the tool is for."""
+    """``ok`` with the resolved path, else ``skip`` (or ``warn`` for apk-audit tools)."""
     path = which(name)
     if path is None:
-        return Probe(f"tool:{name}", "skip", f"{name} not found — {TOOL_HINTS[name]}")
+        status = _TOOL_ABSENT_STATUS.get(name, "skip")
+        return Probe(f"tool:{name}", status, f"{name} not found — {TOOL_HINTS[name]}")
     return Probe(f"tool:{name}", "ok", path)
 
 
@@ -367,12 +383,27 @@ def _claude_json() -> Path | None:
     return None if home is None else home / ".claude.json"
 
 
+def _which_tool(name: str) -> str | None:
+    """Resolve a tool via PATH, falling back to ANDROID_HOME/ANDROID_SDK_ROOT for APK tools."""
+    if found := shutil.which(name):
+        return found
+    if name == "aapt2":
+        from .core.package_resolver import find_aapt
+
+        return find_aapt()
+    if name == "apksigner":
+        from .core.apk_audit import find_apksigner
+
+        return find_apksigner()
+    return None
+
+
 def default_probe_env() -> ProbeEnv:
     """Wire every probe to the real host (PATH, home dir, docker, the nerve daemon)."""
     from .core.device_policy import load_device_policy
 
     return ProbeEnv(
-        which=shutil.which,
+        which=_which_tool,
         check_install=_check_install,
         linc_workspace=_linc_workspace,
         list_projects=_list_projects,

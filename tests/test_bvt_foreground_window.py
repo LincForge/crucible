@@ -101,12 +101,16 @@ class TestForegroundProbe:
             screen_state_responses=[{"foreground": {"package": "com.app", "activity": ".M"}}]
         )
         probe = NerveAdapter(nerve=mock).foreground_probe("DEV")
-        assert probe == {"foreground": {"package": "com.app", "activity": ".M"}, "error": None}
+        assert probe == {
+            "foreground": {"package": "com.app", "activity": ".M"},
+            "error": None,
+            "elements_error": None,
+        }
 
     def test_error_key_surfaces_and_foreground_is_empty(self) -> None:
         mock = make_mock_nerve_client(screen_state_responses=[{"error": "x"}])
         probe = NerveAdapter(nerve=mock).foreground_probe("DEV")
-        assert probe == {"foreground": {}, "error": "x"}
+        assert probe == {"foreground": {}, "error": "x", "elements_error": None}
 
     def test_raising_call_names_the_exception_class(self) -> None:
         mock = make_mock_nerve_client(
@@ -115,6 +119,64 @@ class TestForegroundProbe:
         probe = NerveAdapter(nerve=mock).foreground_probe("DEV")
         assert probe["foreground"] == {}
         assert probe["error"] == "ConnectionError: Nerve unreachable: refused"
+        assert probe["elements_error"] is None
+
+    def test_both_error_and_elements_error_returned_separately(self) -> None:
+        note = "element tree not collected by nerve_state on iOS; call nerve_elements"
+        mock = make_mock_nerve_client(
+            screen_state_responses=[
+                {
+                    "foreground": {"package": OTHER_PKG},
+                    "error": "device offline",
+                    "elements_error": note,
+                }
+            ]
+        )
+        probe = NerveAdapter(nerve=mock).foreground_probe("DEV")
+        assert probe == {
+            "foreground": {"package": OTHER_PKG},
+            "error": "device offline",
+            "elements_error": note,
+        }
+
+    def test_elements_error_only_leaves_error_none(self) -> None:
+        note = "element tree not collected by nerve_state on iOS; call nerve_elements"
+        mock = make_mock_nerve_client(
+            screen_state_responses=[
+                {"foreground": {"package": OTHER_PKG}, "elements_error": note}
+            ]
+        )
+        probe = NerveAdapter(nerve=mock).foreground_probe("DEV")
+        assert probe == {
+            "foreground": {"package": OTHER_PKG},
+            "error": None,
+            "elements_error": note,
+        }
+
+    @pytest.mark.parametrize(
+        ("raw_error", "raw_elements_error", "expected_error", "expected_elements_error"),
+        [
+            (500, 404, "500", "404"),
+            ({"code": 1}, {"note": "x"}, "{'code': 1}", "{'note': 'x'}"),
+            (None, None, None, None),
+            (0, {}, None, None),
+        ],
+    )
+    def test_hostile_non_string_error_and_elements_error(
+        self,
+        raw_error: object,
+        raw_elements_error: object,
+        expected_error: str | None,
+        expected_elements_error: str | None,
+    ) -> None:
+        mock = make_mock_nerve_client(
+            screen_state_responses=[
+                {"error": raw_error, "elements_error": raw_elements_error}
+            ]
+        )
+        probe = NerveAdapter(nerve=mock).foreground_probe("DEV")
+        assert probe["error"] == expected_error
+        assert probe["elements_error"] == expected_elements_error
 
 
 # --- fake-clock timeline behavior through the runner -------------------------
@@ -251,3 +313,55 @@ def test_wrong_app_message_names_the_other_package_and_poll_count(
     assert "app did not foreground" in msg
     assert OTHER_PKG in msg
     assert "polls" in msg
+
+
+def test_elements_error_not_presented_as_nerve_error_on_launch_failure(
+    _fast_poll, tmp_path: Path
+) -> None:
+    note = "element tree not collected by nerve_state on iOS; call nerve_elements"
+    mock = make_mock_nerve_client(
+        screen_state_responses=[
+            {"foreground": {"package": OTHER_PKG}, "elements_error": note}
+        ]
+    )
+    step = BVTStep(action="launch", target=TARGET_PKG)
+    res = _runner(mock, tmp_path).run_suite(_suite(step), device="DEV")
+    t = res.tests[0]
+    assert not t.passed
+    assert "last nerve error" not in t.failure_message
+    assert f"(element tree: {note})" in t.failure_message
+
+
+def test_ios_elements_error_without_foreground_reports_no_nerve_error_and_labels_note(
+    _fast_poll, tmp_path: Path
+) -> None:
+    note = "element tree not collected by nerve_state on iOS; call nerve_elements"
+    mock = make_mock_nerve_client(screen_state_responses=[{"elements_error": note}])
+    step = BVTStep(action="launch", target=TARGET_PKG)
+    res = _runner(mock, tmp_path).run_suite(_suite(step), device="DEV")
+    t = res.tests[0]
+    assert not t.passed
+    assert "last nerve error" not in t.failure_message
+    assert "nerve_state returned no foreground and no error" in t.failure_message
+    assert f"(element tree: {note})" in t.failure_message
+
+
+def test_pin_device_offline_error_and_raised_exception_in_failure_message(
+    _fast_poll, tmp_path: Path
+) -> None:
+    note = "element tree not collected by nerve_state on iOS; call nerve_elements"
+    mock_err = make_mock_nerve_client(
+        screen_state_responses=[{"error": "device offline", "elements_error": note}]
+    )
+    step = BVTStep(action="launch", target=TARGET_PKG)
+    res_err = _runner(mock_err, tmp_path).run_suite(_suite(step), device="DEV")
+    assert not res_err.tests[0].passed
+    assert "last nerve error: device offline" in res_err.tests[0].failure_message
+    assert f"(element tree: {note})" in res_err.tests[0].failure_message
+
+    mock_exc = make_mock_nerve_client(
+        screen_state_responses=[RuntimeError("transport reset")]
+    )
+    res_exc = _runner(mock_exc, tmp_path).run_suite(_suite(step), device="DEV")
+    assert not res_exc.tests[0].passed
+    assert "RuntimeError: transport reset" in res_exc.tests[0].failure_message

@@ -163,15 +163,30 @@ def _env_ref(node: ast.AST) -> str | None:
     return None
 
 
+def _names_read_in_tree(scan_dir: Path, rel_base: Path) -> set[str]:
+    names: set[str] = set()
+    for path in sorted(scan_dir.rglob("*.py")):
+        rel = path.relative_to(rel_base).as_posix()
+        names |= _EnvScan(path.read_text(encoding="utf-8"), rel).names()
+    return names
+
+
 def names_read_under(root: Path) -> set[str]:
     """Env-var names read by every ``*.py`` under ``root / "src"`` (no git needed).
 
     Raises:
         UnanalysableEnvReadError: an env access the walk cannot resolve to literal names.
     """
-    names: set[str] = set()
     src = root / "src"
-    for path in sorted(src.rglob("*.py")):
-        rel = path.relative_to(src).as_posix()
-        names |= _EnvScan(path.read_text(encoding="utf-8"), rel).names()
-    return names
+    return _names_read_in_tree(src, src)
+
+
+def names_read_in_package(pkg_dir: Path) -> set[str]:
+    """Env-var names read by every ``*.py`` under ``pkg_dir`` (no git or ``src/`` needed).
+
+    Raises:
+        UnanalysableEnvReadError: an env access the walk cannot resolve to literal names.
+    """
+    py_files = sorted(pkg_dir.rglob("*.py"))
+    assert py_files, f"no Python files found under {pkg_dir}"
+    return _names_read_in_tree(pkg_dir, pkg_dir.parent)

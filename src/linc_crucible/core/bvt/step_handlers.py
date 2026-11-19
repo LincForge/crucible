@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import time
 from collections.abc import Callable
@@ -87,6 +88,10 @@ _MAX_RETRIES = 10
 _WAIT_MAX_S = 120.0
 _WAIT_FOR_ELEMENT_MAX_S = 120.0
 _DISMISS_TIMEOUT_MAX_S = 30.0
+_YAML_NON_FINITE_TOKENS = frozenset({".nan", ".inf", "+.inf", "-.inf"})
+# Any YAML non-finite token is rejected the same way, so one NaN stands for all of them.
+_NON_FINITE = math.nan
+_NEGATIVE_DURATION_RE = re.compile(r"\A-\s*\d+(?:\.\d+)?[ \t]*(?:s|ms)\Z")
 
 # Actions whose handler is NOT safe to blindly re-run: a partially-succeeded
 # `type` re-types the whole string (foo -> foofoo); long_press may double-fire a
@@ -134,6 +139,45 @@ def _duration_seconds(
         )
         return maximum
     return value
+
+
+def _parse_numeric_duration(raw: object) -> float | None:
+    """Return float seconds when ``raw`` is numeric or a signed duration string, else ``None``."""
+    if isinstance(raw, bool):
+        raise ValueError("validation error: duration must not be a boolean")
+    if isinstance(raw, (int, float)):
+        try:
+            return float(raw)
+        except OverflowError:
+            return _NON_FINITE
+    if not isinstance(raw, str):
+        return None
+    stripped = raw.strip()
+    if stripped.lower() in _YAML_NON_FINITE_TOKENS:
+        return _NON_FINITE
+    if _NEGATIVE_DURATION_RE.fullmatch(stripped):
+        return -1.0
+    try:
+        return float(stripped)
+    except ValueError:
+        return None
+
+
+def _validated_duration_seconds(
+    raw: object,
+    default: float,
+    *,
+    what: str,
+    maximum: float,
+) -> float:
+    """Validate a non-negative finite duration and clamp it to ``maximum``."""
+    if raw is not None:
+        numeric = _parse_numeric_duration(raw)
+        if numeric is not None and (not math.isfinite(numeric) or numeric < 0):
+            raise ValueError(
+                f"validation error: {what} must be finite and non-negative (got {raw!r})"
+            )
+    return _duration_seconds(raw, default, what=what, maximum=maximum)
 
 
 def _parse_retries(params: dict) -> int:
@@ -290,6 +334,14 @@ class BVTStepHandlersMixin:
     # The class-level fallback below only guards a handler invoked outside
     # that path (e.g. a future direct unit test).
     _foreground_default_s: float = _FOREGROUND_TIMEOUT_S
+    # The running test's ``android_activity`` (``_run_test`` sets it per test).
+    _launch_activity: str = ""
+
+    def _launch_app(self, device: str, target_package: str, test_package: str) -> dict:
+        """``nerve.launch``, adding the test's activity when launching its own package."""
+        if self._launch_activity and target_package == test_package:
+            return self._nerve.launch(device, target_package, activity=self._launch_activity)
+        return self._nerve.launch(device, target_package)
 
     def _capture_metrics(self, device: str, package: str) -> dict | None:
         """Capture performance snapshot. Returns None on failure."""
@@ -377,12 +429,19 @@ class BVTStepHandlersMixin:
         including side effects; ``type``/``long_press`` warn (re-run is not
         idempotent). Returns the final attempt's result.
         """
-        retries = _parse_retries(step.params)
+        params = step.params or {}
+        retries = _parse_retries(params)
         if retries > 0 and step.action in _NON_IDEMPOTENT_ACTIONS:
             log.warning("bvt_retries_non_idempotent", action=step.action, retries=retries)
-        backoff = _duration_seconds(
-            step.params.get("retry_backoff"), _DEFAULT_RETRY_BACKOFF_S, what="retry_backoff"
-        )
+        try:
+            backoff = _validated_duration_seconds(
+                params.get("retry_backoff"),
+                _DEFAULT_RETRY_BACKOFF_S,
+                what="retry_backoff",
+                maximum=_WAIT_MAX_S,
+            )
+        except ValueError as exc:
+            return BVTStepResult(action=step.action, passed=False, message=str(exc))
         result = self._execute_step(step, device, package, test_name)
         attempt = 0
         while not result.passed and attempt < retries:
@@ -512,11 +571,15 @@ class BVTStepHandlersMixin:
         saw_valid = False
         last_seen: str | None = None
         last_error: str | None = None
+        last_elements_error: str | None = None
         polls = 0
         while True:
             polls += 1
             probe = self._nerve.foreground_probe(device)
             last_error = latest_nerve_error(probe.get("error"), last_error)
+            last_elements_error = latest_nerve_error(
+                probe.get("elements_error"), last_elements_error
+            )
             fg = probe.get("foreground", {})
             pkg = fg.get("package")
             if pkg:
@@ -531,7 +594,13 @@ class BVTStepHandlersMixin:
             if fallback is not None:
                 return fallback
             message = foreground_failure_message(
-                device, target_package, window_s, polls, last_seen, last_error
+                device,
+                target_package,
+                window_s,
+                polls,
+                last_seen,
+                last_error,
+                last_elements_error,
             )
             return BVTStepResult(action=action, passed=False, message=message)
 
@@ -539,7 +608,7 @@ class BVTStepHandlersMixin:
         self, step: BVTStep, device: str, package: str, _test_name: str
     ) -> BVTStepResult:
         target_package = step.target or package
-        result = self._nerve.launch(device, target_package)
+        result = self._launch_app(device, target_package, package)
         if not result.get("success", False):
             return BVTStepResult(action="launch", passed=False, message=result.get("error", ""))
         window_s = foreground_window_s(
@@ -745,7 +814,12 @@ class BVTStepHandlersMixin:
         self, step: BVTStep, _device: str, _package: str, _test_name: str
     ) -> BVTStepResult:
         raw = step.target or ((step.params or {}).get("duration") if step.params else None)
-        duration = _duration_seconds(raw, 1.0, what="wait.duration", maximum=_WAIT_MAX_S)
+        try:
+            duration = _validated_duration_seconds(
+                raw, 1.0, what="wait.duration", maximum=_WAIT_MAX_S
+            )
+        except ValueError as exc:
+            return BVTStepResult(action="wait", passed=False, message=str(exc))
         time.sleep(duration)
         return BVTStepResult(action="wait", passed=True, message=f"Waited {duration}s")
 

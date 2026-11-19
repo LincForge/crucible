@@ -25,17 +25,44 @@ Ship gate: composite >= 85
 from __future__ import annotations
 
 import json
+import math
 import os
+import stat
+import tempfile
+import threading
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import structlog
+
+from linc_crucible._bounded_read import RegistryTooLargeError
 
 from .state_paths import state_path
 from .store_names import contained_dir, prepare_dir
 
 logger = structlog.get_logger().bind(domain="build_pipeline")
+
+# A score dated further ahead than this was saved under a wrong clock (or restored from
+# elsewhere). Its filename sorts after every real later run, so it is never "latest".
+SCORE_FUTURE_SLACK = timedelta(minutes=5)
+
+
+def parse_score_timestamp(raw_timestamp: str | None) -> datetime | None:
+    """Parse an ISO timestamp from a quality score, treating naive as UTC."""
+    if not isinstance(raw_timestamp, str):
+        return None
+    raw = raw_timestamp.strip()
+    if not raw:
+        return None
+    if raw.endswith(("Z", "z")):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(raw)
+        return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
+    except (ValueError, TypeError):
+        return None
 
 
 def _default_scores_dir() -> Path:
@@ -163,6 +190,17 @@ class QualityScore:
     # authoritative without a re-assay. Always False for a freshly computed
     # score (see `compute()`); only `_load_score()` sets it True.
     stale: bool = False
+    # Filenames of corrupt/malformed score files skipped while loading from disk.
+    skipped_files: list[str] = field(default_factory=list)
+
+    def _skipped_extra(self) -> dict[str, Any]:
+        """Optional skipped-file fields included only when corrupt files were bypassed."""
+        if not self.skipped_files:
+            return {}
+        return {
+            "skipped_count": len(self.skipped_files),
+            "skipped_files": list(self.skipped_files),
+        }
 
     def to_dict(self) -> dict:
         """Serialize to a JSON-compatible dictionary."""
@@ -185,6 +223,7 @@ class QualityScore:
                 }
                 for d in self.dimensions
             ],
+            **self._skipped_extra(),
         }
 
 
@@ -199,11 +238,20 @@ class QualityScorer:
             self._scores_dir = Path(env_path)
         else:
             self._scores_dir = _default_scores_dir()
+        self._skipped_tls = threading.local()
 
     @property
     def scores_dir(self) -> Path:
         """Directory this scorer persists and reads score records from."""
         return self._scores_dir
+
+    @property
+    def last_skipped_files(self) -> list[str]:
+        """Skipped corrupt/malformed filenames from the latest load on this thread."""
+        return list(getattr(self._skipped_tls, "files", ()))
+
+    def _set_last_skipped(self, skipped: list[str]) -> None:
+        self._skipped_tls.files = list(skipped)
 
     @staticmethod
     def _build_mode(
@@ -527,84 +575,220 @@ class QualityScorer:
         safe_ts = score.timestamp.replace(":", "-")
         filepath = project_dir / f"{safe_ts}.json"
 
-        with open(filepath, "w") as f:
-            json.dump(score.to_dict(), f, indent=2)
+        _write_json_atomic(filepath, score.to_dict())
 
         logger.info("score_saved", path=str(filepath))
         return filepath
 
+    def _scan_scores(self, project: str, limit: int) -> tuple[list[QualityScore], list[str]]:
+        """Scan score files newest-first, skipping corrupt/malformed entries.
+
+        Scores dated more than ``SCORE_FUTURE_SLACK`` ahead of the host clock are ignored
+        (logged, not reported as skipped): they would otherwise shadow every real run.
+        """
+        project_dir = contained_dir(self._scores_dir, project)
+        if not project_dir.is_dir():
+            self._set_last_skipped([])
+            return [], []
+
+        scores: list[QualityScore] = []
+        skipped: list[str] = []
+        horizon = datetime.now(UTC) + SCORE_FUTURE_SLACK
+        for filepath in sorted(project_dir.glob("*.json"), reverse=True):
+            score = self._load_score(filepath)
+            if score is None:
+                skipped.append(filepath.name)
+                continue
+            stamped = parse_score_timestamp(score.timestamp)
+            if stamped is not None and stamped > horizon:
+                logger.warning("score_file_future_dated_ignored", path=filepath.name)
+                continue
+            scores.append(score)
+            if len(scores) >= limit:
+                break
+        self._set_last_skipped(skipped)
+        return scores, skipped
+
     def load_latest(self, project: str) -> QualityScore | None:
-        """Load the most recent score for a project.
+        """Load the most recent readable score for a project.
+
+        Falls back past unreadable or malformed newest files and records their
+        filenames on ``skipped_files`` (and ``last_skipped_files``).
 
         Raises:
             InvalidStoreName: If ``project`` is not a safe store name.
         """
-        project_dir = contained_dir(self._scores_dir, project)
-        if not project_dir.is_dir():
+        scores, skipped = self._scan_scores(project, limit=1)
+        if not scores:
             return None
-
-        files = sorted(project_dir.glob("*.json"), reverse=True)
-        if not files:
-            return None
-
-        return self._load_score(files[0])
+        latest = scores[0]
+        latest.skipped_files = skipped
+        return latest
 
     def load_history(self, project: str, limit: int = 10) -> list[QualityScore]:
-        """Load score history for a project, most recent first.
+        """Load readable score history for a project, most recent first.
+
+        Skips unreadable or malformed files and records their filenames in
+        ``last_skipped_files``.
 
         Raises:
             InvalidStoreName: If ``project`` is not a safe store name.
         """
-        project_dir = contained_dir(self._scores_dir, project)
-        if not project_dir.is_dir():
+        if limit <= 0:
+            self._set_last_skipped([])
             return []
-
-        files = sorted(project_dir.glob("*.json"), reverse=True)[:limit]
-        scores = []
-        for f in files:
-            score = self._load_score(f)
-            if score:
-                scores.append(score)
+        scores, _ = self._scan_scores(project, limit=limit)
         return scores
 
     def _load_score(self, filepath: Path) -> QualityScore | None:
         """Load a single score from a JSON file."""
+        if _reject_non_regular_score(filepath):
+            return None
         try:
-            with open(filepath) as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, OSError) as exc:
+            raw = _read_regular_nonblock(filepath, _MAX_SCORE_FILE_BYTES)
+            data = json.loads(raw.decode("utf-8"))
+        except (OSError, RecursionError, ValueError) as exc:
             logger.warning("score_file_read_failed", path=str(filepath), error=str(exc))
             return None
 
-        dimensions = []
-        for dim_data in data.get("dimensions", []):
-            dimensions.append(
-                ScoreDimension(
-                    name=dim_data.get("name", ""),
-                    raw_value=dim_data.get("raw_value", 0.0),
-                    score=dim_data.get("score", 0.0),
-                    weight=dim_data.get("weight", 0.0),
-                    weighted_score=dim_data.get("weighted_score", 0.0),
-                )
+        return _parse_score_data(data, filepath)
+
+
+_MAX_SCORE_FILE_BYTES = 1_048_576
+
+
+def _write_json_atomic(filepath: Path, payload: dict[str, Any]) -> None:
+    """Write *payload* as JSON to *filepath* via a 0600 temp file, fsync, and ``os.replace``."""
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=filepath.parent,
+            prefix=".score-",
+            suffix=".tmp",
+            delete=False,
+        ) as fh:
+            tmp_path = Path(fh.name)
+            os.fchmod(fh.fileno(), 0o600)
+            json.dump(payload, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, filepath)
+    except BaseException:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _reject_non_regular_score(filepath: Path) -> bool:
+    """Return True and log if *filepath* is a symlink or not a regular file."""
+    if filepath.is_symlink():
+        logger.warning("score_file_symlink_skipped", path=str(filepath))
+        return True
+    if not filepath.is_file():
+        logger.warning("score_file_not_regular_skipped", path=str(filepath))
+        return True
+    return False
+
+
+def _read_regular_nonblock(filepath: Path, cap: int) -> bytes:
+    """Open *filepath* with ``O_NONBLOCK``, verify regular file via ``fstat``, and cap reads."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(filepath, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f"not a regular file: {filepath}")
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            data = fh.read(cap + 1)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(data) > cap:
+        raise RegistryTooLargeError(f"{st.st_size} bytes, over the {cap}-byte cap")
+    return data
+
+
+def _is_str(value: object) -> bool:
+    return isinstance(value, str)
+
+
+def _is_finite_number(value: object) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _is_strict_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _parse_score_dimensions(raw_dims: object) -> list[ScoreDimension] | None:
+    """Validate and build ``ScoreDimension`` objects from JSON, or return None if malformed."""
+    if not isinstance(raw_dims, list):
+        return None
+    dimensions: list[ScoreDimension] = []
+    for dim_data in raw_dims:
+        if not isinstance(dim_data, dict):
+            return None
+        name = dim_data.get("name", "")
+        raw_value = dim_data.get("raw_value", 0.0)
+        score = dim_data.get("score", 0.0)
+        weight = dim_data.get("weight", 0.0)
+        weighted_score = dim_data.get("weighted_score", 0.0)
+        if not _is_str(name):
+            return None
+        if not all(_is_finite_number(v) for v in (raw_value, score, weight, weighted_score)):
+            return None
+        dimensions.append(
+            ScoreDimension(
+                name=name,
+                raw_value=float(raw_value),
+                score=float(score),
+                weight=float(weight),
+                weighted_score=float(weighted_score),
             )
-
-        # A record written before schema v2 carries no `schema_version` at all
-        # and was computed before attempted-unmeasured dimensions closed the
-        # ship gate — mark it `stale` so a consumer (e.g. crucible_preflight)
-        # can choose to warn or refuse rather than silently trust it as
-        # authoritative. `data.get(..., 1)` treats a missing key as version 1
-        # (pre-fix); only a record written by THIS `to_dict()` (which always
-        # stamps the current `SCORE_SCHEMA_VERSION`) reads as fresh.
-        schema_version = data.get("schema_version", 1)
-
-        return QualityScore(
-            project=data.get("project", ""),
-            timestamp=data.get("timestamp", ""),
-            mode=data.get("mode", "quick"),
-            composite=data.get("composite", 0.0),
-            ship_gate=data.get("ship_gate", False),
-            dimensions=dimensions,
-            commit_sha=data.get("commit_sha", None),
-            attempted_unmeasured=list(data.get("attempted_unmeasured", [])),
-            stale=schema_version < SCORE_SCHEMA_VERSION,
         )
+    return dimensions
+
+
+def _parse_score_data(data: object, filepath: Path) -> QualityScore | None:
+    """Validate a decoded JSON value as a score dict and return ``QualityScore`` or None."""
+    if not isinstance(data, dict):
+        logger.warning("score_file_not_object", path=str(filepath), type=type(data).__name__)
+        return None
+
+    project = data.get("project", "")
+    timestamp = data.get("timestamp", "")
+    mode = data.get("mode", "quick")
+    composite = data.get("composite", 0.0)
+    ship_gate = data.get("ship_gate", False)
+    commit_sha = data.get("commit_sha", None)
+    schema_version = data.get("schema_version", 1)
+    attempted = data.get("attempted_unmeasured", [])
+    dimensions = _parse_score_dimensions(data.get("dimensions", []))
+
+    if (
+        not (_is_str(project) and _is_str(timestamp) and _is_str(mode))
+        or not _is_finite_number(composite)
+        or not isinstance(ship_gate, bool)
+        or (commit_sha is not None and not _is_str(commit_sha))
+        or not _is_strict_int(schema_version)
+        or not isinstance(attempted, list)
+        or not all(_is_str(item) for item in attempted)
+        or dimensions is None
+    ):
+        logger.warning("score_file_invalid_schema", path=str(filepath))
+        return None
+
+    return QualityScore(
+        project=project,
+        timestamp=timestamp,
+        mode=mode,
+        composite=float(composite),
+        ship_gate=ship_gate,
+        dimensions=dimensions,
+        commit_sha=commit_sha,
+        attempted_unmeasured=list(attempted),
+        stale=schema_version < SCORE_SCHEMA_VERSION,
+    )

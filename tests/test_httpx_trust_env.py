@@ -14,11 +14,9 @@ from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parents[1]
+import linc_crucible
 
-needs_src_tree = pytest.mark.skipif(
-    not (REPO / "src").is_dir(), reason="no src/ tree beside tests/ (wheel-only test root)"
-)
+REPO = Path(__file__).resolve().parents[1]
 
 _MUTANT = re.compile(r"__mutmut_\d+$|^_mutmut_\w*trampoline$")
 
@@ -132,23 +130,36 @@ def scan_httpx_violations_in_source(source: str, rel: str) -> list[str]:
     return violations
 
 
-def scan_httpx_violations(root: Path = REPO) -> list[str]:
-    """Scan all Python files under ``root / 'src'`` for httpx trust_env violations."""
+def _scan_py_files(py_files: list[Path], rel_base: Path) -> list[str]:
     violations: list[str] = []
-    src_root = root / "src"
-    for py_file in _src_py_files(root):
-        rel = py_file.relative_to(src_root).as_posix()
+    for py_file in py_files:
+        rel = py_file.relative_to(rel_base).as_posix()
         violations.extend(
             scan_httpx_violations_in_source(py_file.read_text(encoding="utf-8"), rel)
         )
     return violations
 
 
-@needs_src_tree
+def scan_httpx_violations(root: Path = REPO) -> list[str]:
+    """Scan all Python files under ``root / 'src'`` for httpx trust_env violations."""
+    return _scan_py_files(_src_py_files(root), root / "src")
+
+
+def scan_httpx_violations_in_package(pkg_dir: Path) -> list[str]:
+    """Scan all Python files under an installed package directory for httpx violations."""
+    py_files = sorted(pkg_dir.rglob("*.py"))
+    assert py_files, f"no Python files found under {pkg_dir}"
+    return _scan_py_files(py_files, pkg_dir.parent)
+
+
 def test_all_src_httpx_clients_disable_trust_env_and_no_module_level_calls() -> None:
-    """[contract] Every httpx.Client/AsyncClient under src/ passes trust_env=False and
-    no module-level httpx.get|post|put|request(...) call exists."""
-    violations = scan_httpx_violations(REPO)
+    """[contract] Every httpx.Client/AsyncClient in linc_crucible passes trust_env=False
+    and no module-level httpx.get|post|put|request(...) call exists."""
+    violations = (
+        scan_httpx_violations(REPO)
+        if (REPO / "src").is_dir()
+        else scan_httpx_violations_in_package(Path(linc_crucible.__file__).resolve().parent)
+    )
     assert violations == [], "httpx trust_env contract violations:\n" + "\n".join(violations)
 
 

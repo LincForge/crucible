@@ -9,6 +9,7 @@ object they were bound with; :func:`redacted_logs` therefore edits that live lis
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 from collections.abc import Iterator
@@ -38,9 +39,14 @@ def redact_home(text: str, home: Path | None) -> str:
 
 
 def _redact_value(value: Any, home: Path | None) -> Any:
-    """Apply :func:`redact_home` to strings and paths, recursing into containers."""
+    """Apply :func:`redact_home` to strings, paths and exceptions, recursing into containers.
+
+    An exception object is rendered as its ``repr`` (which carries its message) and redacted.
+    """
     if isinstance(value, str | os.PathLike):
         return redact_home(str(value), home)
+    if isinstance(value, BaseException):
+        return redact_home(repr(value), home)
     if isinstance(value, dict):
         return {key: _redact_value(item, home) for key, item in value.items()}
     if isinstance(value, list | tuple | set | frozenset):
@@ -49,19 +55,22 @@ def _redact_value(value: Any, home: Path | None) -> Any:
 
 
 def _home_redactor(home: Path | None) -> Processor:
-    """A structlog processor rendering ``home`` as ``~`` in every event value.
+    """A structlog processor rendering ``home`` as ``~`` in every event (:func:`redact_event`)."""
+    return functools.partial(redact_event, home=home)
+
+
+def redact_event(
+    logger: WrappedLogger, method_name: str, event_dict: EventDict, home: Path | None
+) -> EventDict:
+    """Render ``home`` as ``~`` in every value of one structlog event.
 
     A logged exception is formatted first (its traceback names files under the home dir)
     and kept under ``traceback``, so the renderer never prints an unredacted one.
     """
-
-    def redact(logger: WrappedLogger, method_name: str, event_dict: EventDict) -> EventDict:
-        if event_dict.get("exc_info"):
-            event_dict = structlog.processors.format_exc_info(logger, method_name, event_dict)
-            event_dict["traceback"] = event_dict.pop("exception", "")
-        return {key: _redact_value(value, home) for key, value in event_dict.items()}
-
-    return redact
+    if event_dict.get("exc_info"):
+        event_dict = structlog.processors.format_exc_info(logger, method_name, event_dict)
+        event_dict["traceback"] = event_dict.pop("exception", "")
+    return {key: _redact_value(value, home) for key, value in event_dict.items()}
 
 
 @contextmanager

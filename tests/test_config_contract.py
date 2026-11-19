@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 import structlog.testing
 
+import linc_crucible
 from linc_crucible.config_contract import (
     ENV_VARS,
     EnvVar,
@@ -27,32 +28,33 @@ from linc_crucible.config_contract import (
     render_env_table,
 )
 from tests.env_read_scan import UnanalysableEnvReadError
+from tests.env_read_scan import names_read_in_package as _names_read_in_package
 from tests.env_read_scan import names_read_under as _names_read_under
 
 REPO = Path(__file__).resolve().parents[1]
 
-# These two scan the source tree beside tests/. A wheel-only test root (linc-publish's
-# selfcheck installs the built wheel and copies only tests/) has no src/ to scan, so they
-# skip there; every checkout (private CI, mutmut's mutants/, the public repo) runs them.
-needs_src_tree = pytest.mark.skipif(
-    not (REPO / "src").is_dir(), reason="no src/ tree beside tests/ (wheel-only test root)"
-)
+
+def _pkg_dir() -> Path:
+    return Path(linc_crucible.__file__).resolve().parent
 
 
 def _names_read_under_src() -> set[str]:
-    return _names_read_under(REPO)
+    return _names_read_in_package(_pkg_dir())
 
 
-@needs_src_tree
 def test_env_table_equals_env_vars_read_under_src() -> None:
     """[contract] the table and the code agree in both directions."""
     assert env_var_names() == frozenset(_names_read_under_src())
 
 
-@needs_src_tree
 def test_src_scan_works_outside_a_git_checkout(tmp_path: Path) -> None:
     """[contract] the scan reads the tree, not git: mutmut's mutants/ and tarballs work."""
-    shutil.copytree(REPO / "src", tmp_path / "src")
+    pkg_dir = _pkg_dir()
+    shutil.copytree(
+        pkg_dir,
+        tmp_path / "src" / pkg_dir.name,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
     scanned = _names_read_under(tmp_path)
     assert scanned == _names_read_under_src()
     assert "LINC_HOME" in scanned

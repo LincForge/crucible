@@ -2187,6 +2187,69 @@ class TestScreenshotFilenameSanitization:
             assert not result.passed
             assert result.harness_error is True
 
+    def test_preplanted_bvt_screenshots_symlink_refused_and_writes_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """[contract] BVTRunner.run_suite refuses bvt_screenshots if it is a symlink,
+        resolves outside output_dir, or cannot be created as a directory."""
+        from linc_crucible.core.store_names import _preview
+        from linc_crucible.core.tool_args import InvalidToolArg
+
+        mock = make_mock_nerve_client()
+        adapter = NerveAdapter(nerve=mock)
+        suite = _make_suite([BVTStep(action="screenshot", target="snap")])
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+
+        out_escape = tmp_path / "out_escape"
+        out_escape.mkdir()
+        (out_escape / "bvt_screenshots").symlink_to(outside, target_is_directory=True)
+        with pytest.raises(InvalidToolArg) as exc_escape:
+            BVTRunner(nerve=adapter, output_dir=out_escape).run_suite(suite, device="DEV1")
+        assert exc_escape.value.field == "output_dir"
+        assert exc_escape.value.reason == "bvt_screenshots must resolve inside output_dir"
+        assert _preview(str(out_escape / "bvt_screenshots")) in str(exc_escape.value)
+        assert list(outside.iterdir()) == []
+        assert mock.screenshot.call_count == 0
+
+        out_self = tmp_path / "out_self"
+        out_self.mkdir()
+        (out_self / "bvt_screenshots").symlink_to(out_self, target_is_directory=True)
+        with pytest.raises(InvalidToolArg) as exc_self:
+            BVTRunner(nerve=adapter, output_dir=out_self).run_suite(suite, device="DEV1")
+        assert exc_self.value.field == "output_dir"
+        assert exc_self.value.reason == "bvt_screenshots must resolve inside output_dir"
+        assert _preview(str(out_self / "bvt_screenshots")) in str(exc_self.value)
+
+        out_inside = tmp_path / "out_inside"
+        (out_inside / "real_sub").mkdir(parents=True)
+        (out_inside / "bvt_screenshots").symlink_to(
+            out_inside / "real_sub", target_is_directory=True
+        )
+        with pytest.raises(InvalidToolArg) as exc_inside:
+            BVTRunner(nerve=adapter, output_dir=out_inside).run_suite(suite, device="DEV1")
+        assert exc_inside.value.field == "output_dir"
+        assert exc_inside.value.reason == "bvt_screenshots must not be a symlink"
+        assert _preview(str(out_inside / "bvt_screenshots")) in str(exc_inside.value)
+        assert list((out_inside / "real_sub").iterdir()) == []
+
+        out_file = tmp_path / "out_file"
+        out_file.mkdir()
+        (out_file / "bvt_screenshots").write_text("blocker", encoding="utf-8")
+        with pytest.raises(InvalidToolArg) as exc_file:
+            BVTRunner(nerve=adapter, output_dir=out_file).run_suite(suite, device="DEV1")
+        assert exc_file.value.field == "output_dir"
+        assert exc_file.value.reason == "cannot create bvt_screenshots (FileExistsError)"
+        assert _preview(str(out_file / "bvt_screenshots")) in str(exc_file.value)
+
+        # Missing parent dirs and repeated runs on the same output_dir both succeed.
+        nested_out = tmp_path / "nested" / "out"
+        res1 = BVTRunner(nerve=adapter, output_dir=nested_out).run_suite(suite, device="DEV1")
+        res2 = BVTRunner(nerve=adapter, output_dir=nested_out).run_suite(suite, device="DEV1")
+        assert res1.passed and res2.passed
+        assert (nested_out / "bvt_screenshots").is_dir()
+
 
 # --- Suite wall-clock budget (audit F11) ---
 

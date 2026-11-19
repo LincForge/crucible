@@ -30,3 +30,5 @@ class AssetExtractorConfig:
     # AI ranking knobs (budget_usd intentionally omitted — meaningless under subscription billing)
     max_ai_candidates: int = 24  # hard cap on frames sent to the vision model
     ai_timeout_seconds: int = 180  # wall-clock ceiling on the claude subprocess
+    max_sampled_frames: int = 600
+    max_frame_pixels: int = 40_000_000

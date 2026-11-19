@@ -168,6 +168,8 @@ def test_absent_statuses_are_pinned(absent: fc.ProbeEnv) -> None:
         "tool:xcrun": "skip",
         "tool:ruff": "skip",
         "tool:pytest": "skip",
+        "tool:aapt2": "warn",
+        "tool:apksigner": "warn",
         "linc-workspace": "skip",
         "projects": "warn",
         "fleet": "warn",
@@ -195,6 +197,77 @@ def test_absent_hints_name_the_env_var_or_command(absent: fc.ProbeEnv) -> None:
         "docker not found — only needed for assay mode=full (MobSF security scan)"
     )
     assert got["tool:adb"].detail.startswith("adb not found — ")
+    assert got["tool:aapt2"].detail == (
+        "aapt2 not found — Android SDK build-tools binary; without it `crucible apk-audit` "
+        "cannot inspect AndroidManifest.xml and reports unmeasured — install Android SDK "
+        "Build-Tools and set ANDROID_HOME or add to PATH"
+    )
+    assert got["tool:apksigner"].detail == (
+        "apksigner not found — Android SDK build-tools binary; without it `crucible apk-audit` "
+        "cannot verify APK signing certificates and reports unmeasured — install Android SDK "
+        "Build-Tools and set ANDROID_HOME or add to PATH"
+    )
+
+
+def test_cli_json_includes_aapt2_and_apksigner_warn_when_absent(absent: fc.ProbeEnv) -> None:
+    """[contract] crucible fuelcheck --json includes aapt2 and apksigner (warn when absent)."""
+    result = _invoke(absent, "--json")
+    assert result.exit_code == 0, result.output
+    by_name = {item["name"]: item for item in json.loads(result.stdout)}
+    for tool_name in ("aapt2", "apksigner"):
+        probe = by_name[f"tool:{tool_name}"]
+        assert probe["status"] == "warn"
+        assert "apk-audit" in probe["detail"]
+        assert "unmeasured" in probe["detail"]
+        assert "ANDROID_HOME" in probe["detail"]
+        assert "PATH" in probe["detail"]
+        assert "Android SDK Build-Tools" in probe["detail"]
+
+
+def test_default_probe_env_which_resolves_aapt2_and_apksigner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """[contract] default_probe_env().which finds aapt2/apksigner on PATH or ANDROID_HOME."""
+    import shutil
+
+    sdk = tmp_path / "android-sdk"
+    bt = sdk / "build-tools" / "35.0.0"
+    bt.mkdir(parents=True)
+    aapt2_bin = bt / "aapt2"
+    apksigner_bin = bt / "apksigner"
+    aapt2_bin.write_text("", encoding="utf-8")
+    apksigner_bin.write_text("", encoding="utf-8")
+
+    # 1. Absent everywhere -> None (even for non-Android tools with ANDROID_HOME set)
+    monkeypatch.setenv("ANDROID_HOME", str(tmp_path / "empty-sdk"))
+    monkeypatch.delenv("ANDROID_SDK_ROOT", raising=False)
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    env = fc.default_probe_env()
+    assert env.which("aapt2") is None
+    assert env.which("apksigner") is None
+    assert env.which("adb") is None
+
+    # 2. Found via ANDROID_HOME/build-tools/*/ when not on PATH
+    monkeypatch.setenv("ANDROID_HOME", str(sdk))
+    assert env.which("aapt2") == str(aapt2_bin)
+    assert env.which("apksigner") == str(apksigner_bin)
+    assert env.which("adb") is None
+
+    # 3. Found via ANDROID_SDK_ROOT when ANDROID_HOME is unset
+    monkeypatch.delenv("ANDROID_HOME", raising=False)
+    monkeypatch.setenv("ANDROID_SDK_ROOT", str(sdk))
+    assert env.which("aapt2") == str(aapt2_bin)
+    assert env.which("apksigner") == str(apksigner_bin)
+
+    # 4. PATH takes precedence over ANDROID_HOME (and works for other tools too)
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda name: f"/opt/path/{name}" if name in {"aapt2", "apksigner", "adb"} else None,
+    )
+    assert env.which("aapt2") == "/opt/path/aapt2"
+    assert env.which("apksigner") == "/opt/path/apksigner"
+    assert env.which("adb") == "/opt/path/adb"
 
 
 def test_present_statuses_are_ok(tmp_path: Path) -> None:
@@ -690,6 +763,7 @@ def test_nerve_up_false_when_daemon_body_is_not_json() -> None:
 def test_module_constants_are_pinned() -> None:
     assert fc.STATUSES == ("ok", "warn", "skip", "fail")
     assert set(fc._STATUS_STYLE) == set(fc.STATUSES)
-    assert set(fc.TOOL_HINTS) == {"adb", "xcrun", "ruff", "pytest"}
+    assert set(fc.TOOL_HINTS) == {"adb", "xcrun", "ruff", "pytest", "aapt2", "apksigner"}
+    assert fc._TOOL_ABSENT_STATUS == {"aapt2": "warn", "apksigner": "warn"}
     assert fc.NERVE_DOWN_HINT == NERVE_HINT
     assert fc._MOBSF_PS[:2] == ["docker", "ps"]

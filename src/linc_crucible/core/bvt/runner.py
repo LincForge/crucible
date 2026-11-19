@@ -26,6 +26,7 @@ from linc_crucible.core.bvt.step_handlers import (
     _parse_duration,
     _parse_retries,
 )
+from linc_crucible.core.tool_args import InvalidToolArg
 
 __all__ = [
     "_SUITE_BUDGET_DEFAULT_S",
@@ -130,6 +131,31 @@ class BVTRunner(BVTStepHandlersMixin):
         # the first dp/touch-target assertion. Stable per run; THE single density source.
         self._density_cache: dict[str, dict] = {}
 
+    def _ensure_screenshots_dir(self) -> None:
+        """Create ``_screenshots_dir`` and refuse symlinks or escapes outside ``_output_dir``."""
+        try:
+            self._screenshots_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise InvalidToolArg(
+                "output_dir",
+                f"cannot create bvt_screenshots ({type(exc).__name__})",
+                str(self._screenshots_dir),
+            ) from exc
+        out_resolved = self._output_dir.resolve()
+        ss_resolved = self._screenshots_dir.resolve()
+        if ss_resolved == out_resolved or not ss_resolved.is_relative_to(out_resolved):
+            raise InvalidToolArg(
+                "output_dir",
+                "bvt_screenshots must resolve inside output_dir",
+                str(self._screenshots_dir),
+            )
+        if self._screenshots_dir.is_symlink():
+            raise InvalidToolArg(
+                "output_dir",
+                "bvt_screenshots must not be a symlink",
+                str(self._screenshots_dir),
+            )
+
     def run_suite(
         self,
         suite: BVTSuite,
@@ -157,7 +183,7 @@ class BVTRunner(BVTStepHandlersMixin):
         """
         start = time.monotonic()
         budget = _SuiteBudget(budget_s, clock)
-        self._screenshots_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_screenshots_dir()
 
         # Device-readiness gate: a locked/asleep/low device silently corrupts
         # artifacts (lock-screen screenshots, no-op taps, 0-byte recordings).
@@ -252,6 +278,7 @@ class BVTRunner(BVTStepHandlersMixin):
     ) -> BVTTestResult:
         """Run a single test. Fail-fast on first step failure."""
         start = time.monotonic()
+        self._launch_activity = test.android_activity
 
         # Reset app for clean state between tests. A test tagged `cold_start`
         # gets a full `pm clear` (first-install state) so consent/onboarding
@@ -381,7 +408,7 @@ class BVTRunner(BVTStepHandlersMixin):
             "bvt_reset_kill_error",
         )
         self._safe_reset_op(
-            lambda: self._nerve.launch(device, package),
+            lambda: self._launch_app(device, package, package),
             test_name,
             package,
             "bvt_reset_launch_failed",

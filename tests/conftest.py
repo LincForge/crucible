@@ -2,12 +2,43 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 from linc_crucible.core.nerve_client import NerveClient
+
+
+def pytest_make_parametrize_id(
+    config: pytest.Config | None, val: object, argname: str
+) -> str | None:
+    """Return an ASCII-safe, backslash-free id for ``str`` parameter values.
+
+    mutmut re-selects tests by node id, and pytest cannot reliably match a node
+    id that holds a backslash escape sequence or non-ASCII text (``'run\\nid'``,
+    ``'\\xe9'``, ``'a\\\\b'``), which caused pr-diff-mutation to fail with an
+    instrument error (exit 4, "not found"). Non-printables, non-ASCII,
+    backslashes, brackets, and overlong strings are collapsed to a clean ASCII
+    prefix plus a short sha1 suffix; other types return ``None``.
+    """
+    if not isinstance(val, str):
+        return None
+    if (
+        val.isascii()
+        and val.isprintable()
+        and "\\" not in val
+        and "[" not in val
+        and "]" not in val
+        and len(val) <= 64
+    ):
+        return val
+    prefix = "".join(c if c.isascii() and (c.isalnum() or c in "._-") else "_" for c in val)[
+        :32
+    ].strip("_")
+    digest = hashlib.sha1(val.encode("utf-8", "surrogatepass")).hexdigest()[:8]
+    return f"{prefix}-{digest}" if prefix else digest
 
 
 @pytest.fixture(autouse=True)

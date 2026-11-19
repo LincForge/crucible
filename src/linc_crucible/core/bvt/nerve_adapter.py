@@ -173,10 +173,16 @@ class NerveAdapter:
             log.warning("bvt_ensure_ready_failed", device=device, error=str(e))
             return {"ready": False, "reason": f"nerve_ensure_ready transport error: {e}"}
 
-    def launch(self, device: str, package: str) -> dict[str, Any]:
-        """Launch an app on a device. Returns {"success": False, "error": ...} on error."""
+    def launch(self, device: str, package: str, activity: str = "") -> dict[str, Any]:
+        """Launch an app on a device. Returns {"success": False, "error": ...} on error.
+
+        ``activity`` picks one launcher when the package has several.
+        """
         try:
-            result = self._nerve.launch(device=device, package=package)
+            if activity:
+                result = self._nerve.launch(device=device, package=package, activity=activity)
+            else:
+                result = self._nerve.launch(device=device, package=package)
             return _normalize_nerve_result(result, "launch")
         except Exception as e:
             log.warning("bvt_launch_failed", device=device, package=package, error=str(e))
@@ -474,25 +480,33 @@ class NerveAdapter:
             return {}
 
     def foreground_probe(self, device: str) -> dict[str, Any]:
-        """Return ``{"foreground": {...} or {}, "error": str | None}``. Never raises.
+        """Probe ``nerve_state`` for foreground, error, and elements_error.
 
-        Same ``nerve_state`` read as ``foreground()``, but preserves WHY no
-        foreground was read instead of collapsing every failure to ``{}`` —
-        the returned dict's own ``error``/``elements_error`` when nerve
-        reported one, or ``f"{type(exc).__name__}: {exc}"`` when the call
-        itself raises. Lets the runner's failure message cite the real cause
-        instead of guessing "daemon unreachable".
+        Returns ``{"foreground": {...}, "error": str | None,
+        "elements_error": str | None}`` and never raises. Same ``nerve_state``
+        read as ``foreground()``, but preserves WHY no foreground was read
+        instead of collapsing every failure to ``{}`` — the returned dict's
+        own ``error`` when nerve reported one (or ``f"{type(exc).__name__}:
+        {exc}"`` when the call itself raises), plus ``elements_error``
+        separately so a standing element-tree note is never misattributed as a
+        nerve error.
         """
         try:
             state = self._nerve.screen_state(device=device)
         except Exception as e:
             log.warning("bvt_foreground_probe_failed", device=device, error=str(e))
-            return {"foreground": {}, "error": f"{type(e).__name__}: {e}"}
+            return {
+                "foreground": {},
+                "error": f"{type(e).__name__}: {e}",
+                "elements_error": None,
+            }
         state = state or {}
-        detail = state.get("error") or state.get("elements_error")
+        error = state.get("error")
+        elements_error = state.get("elements_error")
         return {
             "foreground": state.get("foreground") or {},
-            "error": str(detail) if detail else None,
+            "error": str(error) if error else None,
+            "elements_error": str(elements_error) if elements_error else None,
         }
 
     def metrics(self, device: str, package: str) -> dict[str, Any] | None:

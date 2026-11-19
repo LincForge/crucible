@@ -27,6 +27,7 @@ import math
 import os
 import re
 import stat
+import threading
 import time
 from pathlib import Path
 from typing import IO, Any
@@ -80,6 +81,7 @@ _REDACT_KEYS = frozenset(
         "launch_intent",
         "module",
         "output_dir",
+        "owner",
         "password",
         "project_dir",
         "secret",
@@ -198,14 +200,21 @@ def _finite(value: Any) -> Any:
     return value
 
 
+# mcp 2.x runs sync tools on worker threads, so log writes from one process can
+# overlap: serialize the rotate-then-append step so two threads never both rotate.
+_write_lock = threading.Lock()
+
+
 def _write_log_entry(log_path: Path, entry: dict, max_size_bytes: int) -> None:
     """Rotate *log_path* past *max_size_bytes*, then append *entry* as one JSON line."""
-    ensure_private_dir(log_path.parent)
-    if log_path.exists() and log_path.stat().st_size > max_size_bytes:
-        rotated = log_path.with_suffix(f".{int(time.time())}.jsonl")
-        log_path.rename(rotated)
-    with _open_private_append(log_path) as f:
-        f.write(json.dumps(_finite(entry), default=str, allow_nan=False) + "\n")
+    line = json.dumps(_finite(entry), default=str, allow_nan=False) + "\n"
+    with _write_lock:
+        ensure_private_dir(log_path.parent)
+        if log_path.exists() and log_path.stat().st_size > max_size_bytes:
+            rotated = log_path.with_suffix(f".{int(time.time())}.jsonl")
+            log_path.rename(rotated)
+        with _open_private_append(log_path) as f:
+            f.write(line)
 
 
 def _open_private_append(log_path: Path) -> IO[str]:

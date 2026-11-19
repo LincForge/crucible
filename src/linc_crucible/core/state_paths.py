@@ -38,7 +38,12 @@ def ensure_private_dir(path: Path) -> Path:
     """
     missing = [d for d in (path, *path.parents) if not d.exists()]
     for directory in reversed(missing):
-        directory.mkdir()
+        try:
+            directory.mkdir()
+        except FileExistsError:
+            # Another thread or process created it between the exists() probe and
+            # mkdir(); that creator tightens it, so this call leaves it alone.
+            continue
         os.chmod(directory, _PRIVATE_DIR_MODE)
     return path
 

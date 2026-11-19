@@ -1472,3 +1472,150 @@ class TestArtifactStalenessDetail:
         mock_older.return_value = None
         items = [CheckItem(name="android_apk", found=True, detail="/proj/a.apk")]
         assert _artifact_staleness_detail(items, "/proj") == " (artifact_older_than_head=None)"
+
+
+class TestPreflightSkippedNewerScoreContract:
+    """[contract] Preflight must fail code_quality when load_latest skips newer corrupt files."""
+
+    def test_contract_crucible_preflight_fails_when_newest_score_truncated(
+        self,
+        mock_forge: MagicMock,
+        linc_workspace: Path,
+        project_path: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """[contract] newest score file truncated mid-JSON + three older passing scores ->
+        crucible_preflight code_quality FAILS and names the skipped file (fails on 278647a)."""
+        import linc_crucible.server_context as server_ctx
+        from linc_crucible.assay_tools import crucible_preflight
+
+        _setup_full_metadata(linc_workspace, project_path, mock_forge)
+
+        store = tmp_path / "scores"
+        scorer = QualityScorer(scores_dir=store)
+        now = datetime.now(UTC)
+        for hours_ago in (3, 2, 1):
+            ts = (now - timedelta(hours=hours_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            s = QualityScore(
+                project="TestProject",
+                timestamp=ts,
+                mode="quick",
+                composite=98.0,
+                ship_gate=True,
+            )
+            scorer.save(s)
+
+        newest_name = now.strftime("%Y-%m-%dT%H-%M-%SZ") + ".json"
+        (store / "TestProject" / newest_name).write_text(
+            '{"project": "TestProject", "composite": 98',
+            encoding="utf-8",
+        )
+
+        checker = PreflightChecker(
+            forge_reader=mock_forge, scorer=scorer, linc_workspace=linc_workspace
+        )
+        monkeypatch.setattr(server_ctx, "_initialized", True)
+        monkeypatch.setattr(server_ctx, "_preflight_checker", checker)
+
+        result = crucible_preflight(project="TestProject")
+        code_check = next(c for c in result["checks"] if c["name"] == "code_quality")
+        assert code_check["status"] == "fail"
+        assert code_check["score"] == 0.0
+        assert newest_name in code_check["detail"]
+        assert result["ready"] is False
+        assert "code_quality" in result["blocking"]
+
+    def test_code_quality_fails_naming_skipped_when_all_scores_corrupt(
+        self,
+        mock_forge: MagicMock,
+        linc_workspace: Path,
+        tmp_path: Path,
+    ) -> None:
+        store = tmp_path / "scores_all_bad"
+        scorer = QualityScorer(scores_dir=store)
+        proj_dir = store / "TestProject"
+        proj_dir.mkdir(parents=True)
+        bad_name = "2026-11-18T12-00-00Z.json"
+        (proj_dir / bad_name).write_text("{corrupt", encoding="utf-8")
+
+        checker = PreflightChecker(
+            forge_reader=mock_forge, scorer=scorer, linc_workspace=linc_workspace
+        )
+        report = checker.preflight("TestProject")
+        code_check = next(c for c in report.checks if c.name == "code_quality")
+        assert code_check.status == "fail"
+        assert code_check.score == 0.0
+        assert bad_name in code_check.detail
+
+
+def test_contract_score_trust_messages_are_exact() -> None:
+    """[contract] the exact code_quality detail strings: the missing-score text, the
+    all-skipped text and the skipped-newer text (comma-separated file names)."""
+    from types import SimpleNamespace
+
+    from linc_crucible.core import preflight as pf
+
+    assert pf._format_skipped_names(["b.json", "a.json"]) == "b.json, a.json"
+    assert pf._format_skipped_names([]) is None
+    assert pf._format_skipped_names("b.json") is None
+    assert pf._format_skipped_names(None) is None
+
+    assert (
+        pf._missing_score_detail(SimpleNamespace(last_skipped_files=[]))
+        == "No quality score found — run crucible_assay first"
+    )
+    assert (
+        pf._missing_score_detail(SimpleNamespace())
+        == "No quality score found — run crucible_assay first"
+    )
+    assert pf._missing_score_detail(SimpleNamespace(last_skipped_files=["x.json", "y.json"])) == (
+        "Latest quality score file(s) skipped (x.json, y.json) — re-run crucible_assay"
+    )
+    assert pf._check_score_trust(SimpleNamespace(skipped_files=["n.json", "m.json"])) == (
+        "Newer quality score file(s) skipped (n.json, m.json) — re-run crucible_assay"
+    )
+
+
+def test_contract_future_dated_score_is_not_trusted() -> None:
+    """[contract] a score dated more than the slack into the future fails the trust check
+    (its filename would sort after, and hide, every real later run); a few minutes of
+    clock skew is tolerated."""
+    from datetime import UTC, datetime, timedelta
+    from types import SimpleNamespace
+
+    from linc_crucible.core import preflight as pf
+
+    def _score(delta: timedelta) -> SimpleNamespace:
+        ts = (datetime.now(UTC) + delta).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return SimpleNamespace(stale=False, timestamp=ts, skipped_files=[])
+
+    assert pf._check_score_trust(_score(timedelta(hours=6))) == (
+        "Quality score is dated in the future — check the host clock and re-run crucible_assay"
+    )
+    assert pf._check_score_trust(_score(timedelta(minutes=4))) is None
+    assert pf._check_score_trust(_score(timedelta(minutes=-1))) is None
+
+
+def test_contract_future_dated_score_file_does_not_shadow_later_runs(tmp_path: Path) -> None:
+    """[contract] a score saved under a clock running hours ahead is ignored when picking the
+    latest score, so the next real assay is what preflight sees (re-running assay is not a
+    dead end), and it is not reported as a skipped file."""
+    from datetime import UTC, datetime, timedelta
+
+    from linc_crucible.core import scorer as scorer_mod
+
+    store = scorer_mod.QualityScorer(scores_dir=tmp_path / "scores")
+    now = datetime.now(UTC)
+    for delta, composite in ((timedelta(hours=6), 96.0), (timedelta(minutes=-1), 60.0)):
+        score = scorer_mod.QualityScore(
+            project="myapp",
+            timestamp=(now + delta).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            mode="quick",
+            composite=composite,
+        )
+        store.save(score)
+    latest = store.load_latest("myapp")
+    assert latest is not None
+    assert (latest.composite, latest.skipped_files) == (60.0, [])
+    assert store.load_history("myapp", limit=5)[0].composite == 60.0

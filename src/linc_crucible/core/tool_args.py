@@ -13,6 +13,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from linc_crucible.core.nerve_client import validate_owner
+from linc_crucible.core.state_paths import crucible_root
 from linc_crucible.core.store_names import (
     InvalidStoreName,
     _preview,
@@ -128,6 +130,14 @@ def check_build_type(value: object, field: str = "build_type") -> str:
     return s
 
 
+def check_owner(value: object, field: str = "owner") -> str:
+    """Validate an optional nerve lease owner string."""
+    try:
+        return validate_owner(value)
+    except ValueError as exc:
+        raise InvalidToolArg(field, str(exc), value) from exc
+
+
 def check_relative_dir(
     value: object,
     field: str,
@@ -141,6 +151,59 @@ def check_relative_dir(
     if ".." in path.parts:
         raise InvalidToolArg(field, "must not contain '..' segments", value)
     return s
+
+
+def _check_no_symlink_components(base: Path, rel: Path, field: str, value: object) -> None:
+    """Reject any symlink or unreadable/overlong component along ``base / rel``."""
+    cur = base
+    for part in rel.parts:
+        cur = cur / part
+        try:
+            is_link = cur.is_symlink()
+        except OSError as exc:
+            raise InvalidToolArg(field, "invalid path component", value) from exc
+        if is_link:
+            raise InvalidToolArg(field, "must not traverse a symlink", value)
+
+
+def _resolve_root_prefix(
+    raw: Path, root: Path, root_resolved: Path, field: str, value: object
+) -> tuple[Path, Path]:
+    """Return ``(anchor_base, rel)`` for ``raw`` under ``root`` or raise InvalidToolArg."""
+    if not raw.is_absolute():
+        return root, raw
+    if raw.is_relative_to(root):
+        return root, raw.relative_to(root)
+    if raw.is_relative_to(root_resolved):
+        return root_resolved, raw.relative_to(root_resolved)
+    raise InvalidToolArg(field, "must be inside crucible state root", value)
+
+
+def resolve_bvt_output_dir(value: object, field: str = "output_dir") -> Path:
+    """Validate and resolve a non-None BVT ``output_dir`` strictly inside ``crucible_root()``."""
+    s = check_str(value, field, max_len=MAX_PATH_LEN, allow_empty=False)
+    raw = Path(s)
+    if ".." in raw.parts:
+        raise InvalidToolArg(field, "must not contain '..' segments", value)
+    root = crucible_root()
+    root_resolved = root.resolve(strict=False)
+    base, rel = _resolve_root_prefix(raw, root, root_resolved, field, value)
+    if not rel.parts:
+        raise InvalidToolArg(field, "must be a subdirectory inside crucible state root", value)
+    candidate = base / rel
+    out_resolved = candidate.resolve(strict=False)
+    if out_resolved == root_resolved or not out_resolved.is_relative_to(root_resolved):
+        raise InvalidToolArg(field, "must resolve inside crucible state root", value)
+    _check_no_symlink_components(base, rel, field, value)
+    return candidate
+
+
+def check_bvt_output_dir(value: object, field: str = "output_dir") -> str | None:
+    """Validate an optional BVT ``output_dir`` confined to ``crucible_root()``."""
+    if value is None:
+        return None
+    resolve_bvt_output_dir(value, field)
+    return str(value)
 
 
 def check_str_list(
@@ -196,11 +259,12 @@ _BVT_SPECS: tuple[_Spec, ...] = (
     ("suite_dir", check_relative_dir, ()),
     ("tags", check_str_list, ()),
     ("exclude_tags", check_str_list, ()),
-    ("output_dir", check_optional_str, ()),
+    ("output_dir", check_bvt_output_dir, ()),
     ("app_path", check_optional_str, ()),
     ("budget_s", check_optional_finite, (BUDGET_S_MIN, BUDGET_S_MAX)),
     ("compare_against_baseline", check_bool, ()),
     ("allow_personal", check_bool, ()),
+    ("owner", check_owner, ()),
 )
 
 _EXTRACT_ASSETS_SPECS: tuple[_Spec, ...] = (
@@ -300,6 +364,7 @@ def bvt_args_error(
     app_path: object,
     budget_s: object,
     allow_personal: object,
+    owner: object = "",
 ) -> str | None:
     """Precheck arguments for ``crucible_bvt`` (returns JSON string or ``None``)."""
     out = _run_specs_json(_BVT_SPECS, locals())

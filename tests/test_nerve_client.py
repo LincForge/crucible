@@ -219,6 +219,32 @@ def test_launch_omits_uri_when_empty(client: NerveClient) -> None:
     )
 
 
+def test_launch_sends_activity_only_when_given(client: NerveClient) -> None:
+    """[contract] activity picks one launcher; no uri key leaks in when uri is unset."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"result": {"status": "launched"}}
+    mock_response.raise_for_status = MagicMock()
+
+    with patch.object(client._http, "post", return_value=mock_response) as mock_post:
+        client.launch(device="abc123", package="com.example.app", activity="com.example.app.Main")
+
+    mock_post.assert_called_once_with(
+        "http://localhost:8101/tools/nerve_launch",
+        json={
+            "device": "abc123",
+            "package": "com.example.app",
+            "activity": "com.example.app.Main",
+        },
+        timeout=30,
+    )
+
+
+def test_launch_params_default_has_no_activity() -> None:
+    from linc_crucible.core.nerve_client import _launch_params
+
+    assert _launch_params("D", "com.app", "") == {"device": "D", "package": "com.app"}
+
+
 def test_launch_raises_on_connection_error(client: NerveClient) -> None:
     with (
         patch.object(client._http, "post", side_effect=httpx.ConnectError("refused")),
@@ -565,18 +591,21 @@ def test_screen_state_returns_empty_on_http_error(client: NerveClient) -> None:
 
 
 class TestZeroBridgeImports:
-
     def test_no_bridge_imports_in_source(self) -> None:
         """After Phase 3, crucible must not import ADBBridge or IOSBridge."""
         import ast
         from pathlib import Path
 
-        src_dir = Path(__file__).parent.parent / "src" / "linc_crucible"
+        import linc_crucible
+
+        pkg_dir = Path(linc_crucible.__file__).resolve().parent
+        py_files = sorted(pkg_dir.rglob("*.py"))
+        assert py_files, f"no Python files found under {pkg_dir}"
         violations = []
-        for py_file in src_dir.rglob("*.py"):
+        for py_file in py_files:
             if py_file.name in ("adb_bridge.py", "ios_bridge.py"):
                 continue  # Files being deleted
-            tree = ast.parse(py_file.read_text())
+            tree = ast.parse(py_file.read_text(encoding="utf-8"))
             for node in ast.walk(tree):
                 if (
                     isinstance(node, ast.ImportFrom)

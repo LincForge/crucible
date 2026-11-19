@@ -139,7 +139,7 @@ async def test_compare_against_baseline_true_attaches_block(
         await crucible_bvt(
             project="MyApp",
             device="DEV1",
-            output_dir=str(tmp_path / "out"),
+            output_dir="out",
             compare_against_baseline=True,
         )
     )
@@ -183,7 +183,7 @@ async def test_crucible_bvt_compare_run_exception_returns_suite_result(
         await crucible_bvt(
             project="MyApp",
             device="DEV1",
-            output_dir=str(tmp_path / "out"),
+            output_dir="out",
             compare_against_baseline=True,
         )
     )
@@ -224,7 +224,7 @@ async def test_compare_against_baseline_false_is_inert(
         await crucible_bvt(
             project="MyApp",
             device="DEV1",
-            output_dir=str(tmp_path / "out"),
+            output_dir="out",
         )
     )
     assert out["visual_advisory"] is None
@@ -289,7 +289,7 @@ async def test_result_carries_total_harness_errors_and_names(
         await crucible_bvt(
             project="MyApp",
             device="DEV1",
-            output_dir=str(tmp_path / "out"),
+            output_dir="out",
         )
     )
 
@@ -465,9 +465,7 @@ async def test_device_not_ready_returns_structured_payload(
         tests=[SimpleNamespace(name="t1", tags=[])], package="com.x"
     )
 
-    out = json.loads(
-        await crucible_bvt(project="MyApp", device="DEV1", output_dir=str(tmp_path / "out"))
-    )
+    out = json.loads(await crucible_bvt(project="MyApp", device="DEV1", output_dir="out"))
     assert out["ran"] is False
     assert out["reason"] == "device-not-ready"
     assert "device asleep" in out["detail"]
@@ -536,9 +534,7 @@ async def test_reservation_check_swallows_connection_error(
     mock_load.return_value = SimpleNamespace(tests=[], package="com.x")
     mock_runner_cls.return_value.run_suite.return_value = _fake_run_result()
 
-    out = json.loads(
-        await crucible_bvt(project="MyApp", device="DEV1", output_dir=str(tmp_path / "out"))
-    )
+    out = json.loads(await crucible_bvt(project="MyApp", device="DEV1", output_dir="out"))
     assert out["ran"] is True
 
 
@@ -656,9 +652,7 @@ async def test_unresolvable_package_does_not_block_run(
     mock_resolve.return_value = None
     mock_runner_cls.return_value.run_suite.return_value = _fake_run_result()
 
-    out = json.loads(
-        await crucible_bvt(project="MyApp", device="DEV1", output_dir=str(tmp_path / "out"))
-    )
+    out = json.loads(await crucible_bvt(project="MyApp", device="DEV1", output_dir="out"))
     assert out["ran"] is True
 
 
@@ -687,9 +681,7 @@ async def test_per_test_failure_still_returns_ran_true(
     mock_load.return_value = SimpleNamespace(tests=[], package="com.x")
     mock_runner_cls.return_value.run_suite.return_value = _failing_run_result()
 
-    out = json.loads(
-        await crucible_bvt(project="MyApp", device="DEV1", output_dir=str(tmp_path / "out"))
-    )
+    out = json.loads(await crucible_bvt(project="MyApp", device="DEV1", output_dir="out"))
     assert out["ran"] is True
     assert out["passed"] is False
     assert out["total_failed"] == 1
@@ -713,7 +705,13 @@ async def test_unexpected_exception_still_raises(
     mock_init: MagicMock,
     tmp_path,
 ) -> None:
-    """NEGATIVE: an unexpected exception must NOT be converted to ran=false."""
+    """NEGATIVE: an unexpected exception must NOT be converted to ran=false.
+
+    It surfaces as the SDK ToolError carrying the cause (mcp 2.1+ client boundary),
+    chained to the original ValueError.
+    """
+    from linc_cli_kit import SDKToolError
+
     from linc_crucible.bvt_tools import crucible_bvt
 
     (tmp_path / ".bvt").mkdir()
@@ -722,8 +720,9 @@ async def test_unexpected_exception_still_raises(
     mock_load.return_value = SimpleNamespace(tests=[], package="com.x")
     mock_runner_cls.return_value.run_suite.side_effect = ValueError("crucible bug")
 
-    with pytest.raises(ValueError, match="crucible bug"):
-        await crucible_bvt(project="MyApp", device="DEV1", output_dir=str(tmp_path / "out"))
+    with pytest.raises(SDKToolError, match="ValueError: crucible bug") as info:
+        await crucible_bvt(project="MyApp", device="DEV1", output_dir="out")
+    assert isinstance(info.value.__cause__, ValueError)
 
 
 # ---------------------------------------------------------------------------
@@ -783,7 +782,7 @@ async def test_exclude_tags_applied_after_include_filter(
             device="DEV1",
             tags=["watch"],
             exclude_tags=["ios"],
-            output_dir=str(tmp_path / "out"),
+            output_dir="out",
         )
     )
     assert out["ran"] is True
@@ -856,9 +855,7 @@ async def test_exclude_tags_default_none_is_byte_identical_to_today(
     mock_runner_cls.return_value.run_suite.side_effect = _make_result_from_suite
 
     out = json.loads(
-        await crucible_bvt(
-            project="MyApp", device="DEV1", tags=["watch"], output_dir=str(tmp_path / "out")
-        )
+        await crucible_bvt(project="MyApp", device="DEV1", tags=["watch"], output_dir="out")
     )
     assert out["ran"] is True
     assert out["total_run"] == 2
@@ -911,7 +908,7 @@ async def test_app_path_forwarded_to_run_suite(
     await crucible_bvt(
         project="MyApp",
         device="DEV1",
-        output_dir=str(tmp_path / "out"),
+        output_dir="out",
         app_path="/tmp/Foo.app",
     )
 
@@ -948,7 +945,7 @@ async def test_app_path_default_is_forwarded_as_explicit_none(
     await crucible_bvt(
         project="MyApp",
         device="DEV1",
-        output_dir=str(tmp_path / "out"),
+        output_dir="out",
     )
 
     mock_runner_cls.return_value.run_suite.assert_called_once()
@@ -1029,7 +1026,7 @@ async def test_platform_mismatch_skips_wrong_platform_test(
             project="MyApp",
             device="DEV",
             tags=["smoke"],
-            output_dir=str(tmp_path / "out"),
+            output_dir="out",
         )
     )
 
@@ -1125,7 +1122,7 @@ async def test_platform_mismatch_unknown_device_leaves_suite_untouched(
             project="MyApp",
             device="DEV",
             tags=["smoke"],
-            output_dir=str(tmp_path / "out"),
+            output_dir="out",
         )
     )
 
@@ -1172,7 +1169,7 @@ async def test_platform_mismatch_discover_raises_leaves_suite_untouched(
             project="MyApp",
             device="DEV",
             tags=["smoke"],
-            output_dir=str(tmp_path / "out"),
+            output_dir="out",
         )
     )
 
@@ -1216,7 +1213,7 @@ async def test_platform_mismatch_untagged_test_always_runs(
             project="MyApp",
             device="DEV",
             tags=["smoke"],
-            output_dir=str(tmp_path / "out"),
+            output_dir="out",
         )
     )
 
@@ -1261,9 +1258,7 @@ async def test_budget_s_forwarded_to_run_suite(
     _patch_bvt_env(mock_forge, mock_adapter, mock_load, tmp_path)
     mock_runner_cls.return_value.run_suite.return_value = _fake_run_result()
 
-    await crucible_bvt(
-        project="MyApp", device="DEV1", output_dir=str(tmp_path / "out"), budget_s=42.0
-    )
+    await crucible_bvt(project="MyApp", device="DEV1", output_dir="out", budget_s=42.0)
 
     mock_runner_cls.return_value.run_suite.assert_called_once()
     _, call_kwargs = mock_runner_cls.return_value.run_suite.call_args
@@ -1293,7 +1288,7 @@ async def test_budget_s_default_is_runner_default(
     _patch_bvt_env(mock_forge, mock_adapter, mock_load, tmp_path)
     mock_runner_cls.return_value.run_suite.return_value = _fake_run_result()
 
-    await crucible_bvt(project="MyApp", device="DEV1", output_dir=str(tmp_path / "out"))
+    await crucible_bvt(project="MyApp", device="DEV1", output_dir="out")
 
     _, call_kwargs = mock_runner_cls.return_value.run_suite.call_args
     assert call_kwargs["budget_s"] == _SUITE_BUDGET_DEFAULT_S
@@ -1332,9 +1327,7 @@ async def test_budget_exhausted_run_serializes_red(
     )
 
     out = json.loads(
-        await crucible_bvt(
-            project="MyApp", device="DEV1", output_dir=str(tmp_path / "out"), budget_s=1000
-        )
+        await crucible_bvt(project="MyApp", device="DEV1", output_dir="out", budget_s=1000)
     )
 
     assert out["ran"] is True
@@ -1416,7 +1409,7 @@ async def test_personal_device_runs_with_allow_personal(
         await crucible_bvt(
             project="MyApp",
             device=_PERSONAL_WATCH_SERIAL,
-            output_dir=str(tmp_path / "out"),
+            output_dir="out",
             allow_personal=True,
         )
     )

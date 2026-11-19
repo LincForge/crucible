@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import anyio
 import pytest
+from linc_cli_kit import SDKToolError
 from linc_cli_kit.registry import stubbed_tool_fn
 from linc_cli_kit.testing import assert_cli_parity
-from mcp.server.fastmcp.exceptions import ToolError as FastMCPToolError
 
 from linc_crucible.cli import _registry_server, cli
 
@@ -43,11 +43,11 @@ def test_contract_mcp_tools_reject_unknown_arguments_and_forbid_extra_schema() -
     tools = anyio.run(server.list_tools)
     assert len(tools) == 8
     for tool in tools:
-        assert tool.inputSchema.get("additionalProperties") is False, tool.name
+        assert tool.input_schema.get("additionalProperties") is False, tool.name
 
     with (
         stubbed_tool_fn(server, "crucible_pour"),
-        pytest.raises(FastMCPToolError, match="__unknown_arg__"),
+        pytest.raises(SDKToolError, match="__unknown_arg__"),
     ):
         anyio.run(
             server.call_tool,

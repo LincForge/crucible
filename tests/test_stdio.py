@@ -20,7 +20,7 @@ import sys
 import anyio
 import pytest
 from mcp.shared.message import SessionMessage
-from mcp.types import JSONRPCMessage
+from mcp.types import jsonrpc_message_adapter
 
 VALID_JSONRPC = '{"jsonrpc":"2.0","method":"initialize","id":1}'
 
@@ -36,7 +36,7 @@ import sys
 
 import anyio
 from mcp.shared.message import SessionMessage
-from mcp.types import JSONRPCMessage
+from mcp.types import jsonrpc_message_adapter
 
 from linc_crucible.stdio import stdio_server
 
@@ -60,7 +60,7 @@ async def _main() -> None:
         try:
             with anyio.fail_after(4):
                 async with stdio_server() as (read_stream, write_stream):
-                    response = JSONRPCMessage.model_validate(
+                    response = jsonrpc_message_adapter.validate_python(
                         {"jsonrpc": "2.0", "id": 1, "result": {"status": "ok"}}
                     )
                     await write_stream.send(SessionMessage(response))
@@ -70,7 +70,7 @@ async def _main() -> None:
                             if isinstance(item, Exception):
                                 _trace("EXC", type(item).__name__)
                             else:
-                                _trace("MSG", item.message.root.method or "")
+                                _trace("MSG", item.message.method or "")
                     except anyio.EndOfStream:
                         _trace("EOF")
                     # No manual write_stream.aclose() here — falling through to
@@ -82,7 +82,7 @@ async def _main() -> None:
 
     async with stdio_server() as (read_stream, write_stream):
         if MODE == "echo":
-            response = JSONRPCMessage.model_validate(
+            response = jsonrpc_message_adapter.validate_python(
                 {"jsonrpc": "2.0", "id": 1, "result": {"status": "ok"}}
             )
             await write_stream.send(SessionMessage(response))
@@ -93,7 +93,7 @@ async def _main() -> None:
                 if isinstance(item, Exception):
                     _trace("EXC", type(item).__name__)
                 else:
-                    _trace("MSG", item.message.root.method or "")
+                    _trace("MSG", item.message.method or "")
         except anyio.EndOfStream:
             _trace("EOF")
         finally:
@@ -169,7 +169,7 @@ class TestStdioServer:
         assert '"result"' in decoded
         # The framing is one JSON object per newline-terminated line.
         first_line = decoded.splitlines()[0]
-        JSONRPCMessage.model_validate_json(first_line)
+        jsonrpc_message_adapter.validate_json(first_line)
 
     def test_malformed_input_sends_exception(self) -> None:
         """Non-JSON input is forwarded as an Exception through read_stream, not a crash."""
@@ -211,7 +211,7 @@ class TestStdioServer:
         decoded = out.decode("utf-8").strip()
         assert decoded, "expected the queued response to be flushed to stdout, not dropped"
         assert '"result"' in decoded
-        JSONRPCMessage.model_validate_json(decoded.splitlines()[0])
+        jsonrpc_message_adapter.validate_json(decoded.splitlines()[0])
 
 
 class TestStdioServerRealPipes:
@@ -257,12 +257,12 @@ class TestStdioServerRealPipes:
                         # Valid line → SessionMessage.
                         first = await read_stream.receive()
                         assert isinstance(first, SessionMessage)
-                        assert first.message.root.method == "initialize"
+                        assert first.message.method == "initialize"
                         # Malformed line → Exception forwarded, not a crash.
                         second = await read_stream.receive()
                         assert isinstance(second, Exception)
                         # Exercise the stdout writer branch.
-                        response = JSONRPCMessage.model_validate(
+                        response = jsonrpc_message_adapter.validate_python(
                             {"jsonrpc": "2.0", "id": 1, "result": {"status": "ok"}}
                         )
                         await write_stream.send(SessionMessage(response))

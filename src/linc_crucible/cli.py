@@ -34,6 +34,7 @@ _logging.configure_cli_structlog()
 
 from rich.console import Console  # noqa: E402
 from rich.table import Table  # noqa: E402
+from rich.text import Text  # noqa: E402
 
 import linc_crucible.server_context as server_ctx  # noqa: E402
 from linc_crucible import __version__  # noqa: E402
@@ -433,6 +434,16 @@ def _render_assay(res: dict[str, Any]) -> str:
     return _human_text(_build)
 
 
+def _print_score_skipped(con: Console, res: dict[str, Any]) -> None:
+    skipped = res.get("skipped_files")
+    if isinstance(skipped, list) and skipped:
+        names = ", ".join(_escape_terminal_text(name) for name in skipped)
+        con.print(
+            f"  Skipped {len(skipped)} corrupt score file(s): {names}",
+            markup=False,
+        )
+
+
 def _render_score(res: dict[str, Any]) -> str:
     def _build(con: Console) -> None:
         if "scores" in res:
@@ -441,6 +452,7 @@ def _render_score(res: dict[str, Any]) -> str:
                 con.print(f"[yellow]No scores found for {res.get('project', '')}[/yellow]")
                 if res.get("message"):
                     con.print(f"[yellow]{res['message']}[/yellow]")
+                _print_score_skipped(con, res)
                 return
 
             table = Table(title=f"Score History: {res.get('project', '')}")
@@ -456,6 +468,7 @@ def _render_score(res: dict[str, Any]) -> str:
                 )
 
             con.print(table)
+            _print_score_skipped(con, res)
             return
 
         gate_icon = "[green]PASS[/green]" if res.get("ship_gate") else "[red]FAIL[/red]"
@@ -472,6 +485,7 @@ def _render_score(res: dict[str, Any]) -> str:
                 f"    {dim.get('name')}: {dim.get('score', 0):.0f} x "
                 f"{dim.get('weight', 0):.2f} = {dim.get('weighted_score', 0):.1f}"
             )
+        _print_score_skipped(con, res)
 
     return _human_text(_build)
 
@@ -633,10 +647,10 @@ def bellows() -> None:
 
     async def _run_stdio() -> None:
         async with stdio_server() as (read_stream, write_stream):
-            await server._mcp_server.run(
+            await server._lowlevel_server.run(
                 read_stream,
                 write_stream,
-                server._mcp_server.create_initialization_options(),
+                server._lowlevel_server.create_initialization_options(),
             )
 
     asyncio.run(_run_stdio())
@@ -869,11 +883,166 @@ def logo() -> None:
     console.print(CRUCIBLE_BANNER)
 
 
+# --- APK audit command ---
+
+
+# Visible escapes for every terminal control or invisible format/separator character a hostile
+# APK string could carry: C0/C1 controls as \xNN (\t, \n, \r keep their names) and Unicode
+# Cf/Zl/Zp characters (bidi controls, zero-width chars, U+2028/U+2029, BOM, tag chars) as
+# \uNNNN / \UNNNNNNNN.
+_UNICODE_FORMAT_SEPARATOR_CODEPOINTS = (
+    0x00AD,
+    *range(0x0600, 0x0606),
+    0x061C,
+    0x06DD,
+    0x070F,
+    0x0890,
+    0x0891,
+    0x08E2,
+    0x180E,
+    *range(0x200B, 0x2010),
+    *range(0x2028, 0x202F),
+    *range(0x2060, 0x2065),
+    *range(0x2066, 0x2070),
+    0xFEFF,
+    *range(0xFFF9, 0xFFFC),
+    0x110BD,
+    0x110CD,
+    *range(0x13430, 0x13440),
+    *range(0x1BCA0, 0x1BCA4),
+    *range(0x1D173, 0x1D17B),
+    0xE0001,
+    *range(0xE0020, 0xE0080),
+)
+_TERMINAL_ESCAPES: dict[int, str] = {c: f"\\x{c:02x}" for c in (*range(0x20), *range(0x7F, 0xA0))}
+_TERMINAL_ESCAPES.update(
+    {
+        c: f"\\u{c:04x}" if c <= 0xFFFF else f"\\U{c:08x}"
+        for c in _UNICODE_FORMAT_SEPARATOR_CODEPOINTS
+    }
+)
+_TERMINAL_ESCAPES.update({ord("\t"): "\\t", ord("\n"): "\\n", ord("\r"): "\\r"})
+
+
+def _escape_terminal_text(value: object) -> str:
+    """Escape C0/C1 and Unicode Cf/Zl/Zp chars as visible ``\\x..`` / ``\\u....`` sequences."""
+    return str(value).translate(_TERMINAL_ESCAPES)
+
+
+def _apk_audit_verdict(summary: dict[str, Any]) -> str:
+    if not summary["measured"]:
+        return "UNMEASURED"
+    return "PASS" if summary["passed"] else "FAIL"
+
+
+def _render_apk_audit(payload: dict[str, Any]) -> str:
+    def _build(con: Console) -> None:
+        # Strings here come from the untrusted APK (ZIP entry names, manifest values) or
+        # the caller's path: escape C0/C1/bidi controls and print them literally, never
+        # parse them as Rich markup.
+        def say(text: str) -> None:
+            text = _escape_terminal_text(text)
+            con.print(text, markup=False, highlight=False)
+
+        manifest = payload["manifest"]
+        archive = payload["archive"]
+        signing = payload["signing"]
+        assetlinks = payload["assetlinks"]
+        summary = payload["summary"]
+        pkg = manifest.get("package") or manifest.get("status")
+        certs = ", ".join(signing["cert_sha256s"]) or "none"
+        verdict = _apk_audit_verdict(summary)
+
+        say(f"APK Audit: {payload['apk_path']} [{verdict}]")
+        say(f"  Package: {pkg}")
+        if manifest_detail := manifest.get("detail"):
+            say(f"    detail: {manifest_detail}")
+        say(f"  SHA-256: {payload['sha256']}")
+        say(
+            f"  DEX: {archive['dex_count']} file(s), "
+            f"{archive['dex_uncompressed_bytes']} B uncompressed, "
+            f"{archive['dex_compressed_bytes']} B compressed "
+            f"(ratio {archive['dex_compressed_ratio']})"
+        )
+        say(f"  Signing: {signing['status']} (certs: {certs})")
+        if signing_detail := signing.get("detail"):
+            say(f"    detail: {signing_detail}")
+        say(f"  Assetlinks: {assetlinks['status']}")
+        if assetlinks_detail := assetlinks.get("detail"):
+            say(f"    detail: {assetlinks_detail}")
+        say(
+            f"  Summary: high={summary['high']}, medium={summary['medium']}, "
+            f"low={summary['low']}, info={summary['info']}, "
+            f"measured={summary['measured']}"
+        )
+
+        findings = payload["findings"]
+        if not findings:
+            say("  Findings: none")
+            return
+
+        table = Table(title="Findings")
+        table.add_column("Severity")
+        table.add_column("Code")
+        table.add_column("Detail")
+        for finding in findings:
+            table.add_row(
+                *(Text(_escape_terminal_text(finding[k])) for k in ("severity", "code", "detail"))
+            )
+        con.print(table)
+
+    return _human_text(_build)
+
+
+@cli.command("apk-audit")
+@click.argument("apk_path")
+@click.option(
+    "--assetlinks",
+    "assetlinks_path",
+    default=None,
+    help="Optional local assetlinks.json file to verify against APK signing certificates.",
+)
+@click.option(
+    "--strict",
+    is_flag=True,
+    default=False,
+    help=(
+        "Exit 1 when summary.passed is false (high finding, tool error, or unmeasured). "
+        "Without --strict, exit code stays 0."
+    ),
+)
+def apk_audit(apk_path: str, assetlinks_path: str | None, strict: bool) -> None:
+    """Run an offline static audit on a standalone Android APK binary.
+
+    Without --strict, exit code stays 0 even when findings, tool errors, or
+    unmeasured checks occur (invalid inputs exit 2). Pass --strict to exit 1
+    when summary.passed is false.
+    """
+    from .core.apk_audit import ApkAuditError, audit_apk
+
+    ctx = click.get_current_context()
+    try:
+        payload = audit_apk(apk_path, assetlinks_path=assetlinks_path)
+    except ApkAuditError as exc:
+        err = UsageError(str(exc))
+        ctx.exit(emit_exception(err, mode=current_mode()))
+
+    rc = emit(
+        payload,
+        mode=current_mode(),
+        renderer=_render_apk_audit,
+        tool="apk_audit",
+    )
+    if strict and not payload["summary"]["passed"]:
+        ctx.exit(1)
+    ctx.exit(rc)
+
+
 # --- linc-cli-kit mount (MCP-to-CLI parity) ---
 
 
 def _registry_server() -> Any:
-    """Return the FastMCP server with every tool module imported (registration is at import).
+    """Return the MCPServer with every tool module imported (registration is at import).
 
     Deliberately does NOT import ``linc_crucible.mcp_server`` — that module wires the stdio
     MCP entrypoint (``bellows``); a CLI process only needs the tool registry, not the stdio
@@ -919,7 +1088,9 @@ def _decode_tool_result(spec_name: str, raw: Any) -> dict[str, Any]:
 def _local_fn(spec: Any) -> Any:
     import inspect
 
-    fn = spec.fn
+    # The MCP-facing wrapper turns failures into the SDK ToolError for the client; the CLI
+    # keeps classifying the original exception, so it calls the logged-only layer.
+    fn = getattr(spec.fn, "__crucible_logged__", spec.fn)
     if inspect.iscoroutinefunction(fn):
 
         async def _async_wrapped(**payload: Any) -> Any:

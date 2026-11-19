@@ -103,6 +103,7 @@ def test_redact_keys_cover_serials_paths_and_credentials() -> None:
         "launch_intent",
         "module",
         "output_dir",
+        "owner",
         "password",
         "project_dir",
         "secret",

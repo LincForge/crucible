@@ -2,7 +2,7 @@ import asyncio
 import json
 
 from linc_crucible.core.asset_config import AssetExtractorConfig
-from linc_crucible.core.asset_extractor import extract_assets
+from linc_crucible.core.asset_extractor import _redact_path_text, extract_assets
 from linc_crucible.core.tool_args import extract_assets_args_error
 from linc_crucible.server_context import _observed_tool, server
 
@@ -20,7 +20,9 @@ async def _extract_assets_json(video_path: str, max_assets: int) -> str:
     try:
         result = await asyncio.to_thread(extract_assets, video_path, config)
     except (FileNotFoundError, ValueError) as exc:
-        return json.dumps({"error": str(exc), "assets": [], "fallback_used": False})
+        return json.dumps(
+            {"error": _redact_path_text(str(exc)), "assets": [], "fallback_used": False}
+        )
     return json.dumps(result)
 
 

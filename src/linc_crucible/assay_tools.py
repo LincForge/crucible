@@ -138,6 +138,17 @@ def crucible_score(
     return name_guarded(lambda: _read_score(project, history, limit))
 
 
+def _skipped_score_fields(scorer: Any) -> dict[str, Any]:
+    """Return skipped-file metadata when ``scorer`` exposed a non-empty list."""
+    skipped = getattr(scorer, "last_skipped_files", None)
+    if isinstance(skipped, list) and skipped:
+        return {
+            "skipped_count": len(skipped),
+            "skipped_files": list(skipped),
+        }
+    return {}
+
+
 def _read_score(project: str, history: bool, limit: int) -> dict[str, Any]:
     """Body of ``crucible_score`` after argument validation (latest or history)."""
     if history:
@@ -146,6 +157,7 @@ def _read_score(project: str, history: bool, limit: int) -> dict[str, Any]:
             "project": project,
             "count": len(scores),
             "scores": [s.to_dict() for s in scores],
+            **_skipped_score_fields(ctx._scorer),
         }
         if not scores:
             result.update(
@@ -160,6 +172,7 @@ def _read_score(project: str, history: bool, limit: int) -> dict[str, Any]:
                 "error": f"No scores found. Run 'crucible assay {project}' first.",
                 "error_category": "not_found",
                 **empty_inventory(ctx._scorer.scores_dir, f"project '{project}'", "scores"),
+                **_skipped_score_fields(ctx._scorer),
             }
         return latest.to_dict()
 

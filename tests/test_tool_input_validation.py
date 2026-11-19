@@ -144,6 +144,7 @@ class TestBuildTypeAllowlist:
             "modules:\n  - name: app\n    platform: android\n    device_type: phone\n",
         )
         deployer = Deployer(forge_reader=reader, nerve_client=MagicMock())
+        monkeypatch.setattr(ctx, "_initialized", True)
         monkeypatch.setattr(ctx, "_ensure_initialized", lambda: None)
         monkeypatch.setattr(ctx, "_deployer", deployer)
 
@@ -1047,3 +1048,508 @@ class TestToolArgsHelpers:
             )
             is not None
         )
+
+
+# ---------------------------------------------------------------------------
+# 6. [contract] crucible_bvt output_dir confinement (R4 finding 7)
+# ---------------------------------------------------------------------------
+
+
+class TestBvtOutputDirConfinement:
+    """[contract] crucible_bvt confines output_dir to crucible_root() and creates nothing."""
+
+    @staticmethod
+    def _setup_ready_bvt_env(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> tuple[Path, MagicMock]:
+        from types import SimpleNamespace
+
+        from linc_crucible.core.device_policy import DevicePolicy
+
+        proj_dir = tmp_path / "proj"
+        (proj_dir / ".bvt").mkdir(parents=True)
+        (proj_dir / ".bvt" / "smoke.yaml").write_text(
+            "package: com.example\ntests:\n  - name: t1\n    steps:\n      - wait: 0s\n",
+            encoding="utf-8",
+        )
+        fake_reader = SimpleNamespace(get=lambda _name: SimpleNamespace(path=str(proj_dir)))
+        mock_adapter = MagicMock()
+        mock_adapter.available = True
+        mock_adapter.discover.return_value = [{"serial": "DEV1", "platform": "android"}]
+        mock_adapter.ensure_ready.return_value = {"ready": True, "reason": "ready"}
+        mock_nerve = MagicMock()
+        mock_nerve.pool.return_value = {}
+        monkeypatch.setattr(ctx, "_initialized", True)
+        monkeypatch.setattr(ctx, "_ensure_initialized", lambda: None)
+        monkeypatch.setattr(ctx, "_forge_reader", fake_reader)
+        monkeypatch.setattr(ctx, "_bvt_nerve_adapter", mock_adapter)
+        monkeypatch.setattr(ctx, "_nerve_client", mock_nerve)
+        monkeypatch.setattr(
+            ctx,
+            "_cached_device_policy",
+            DevicePolicy(personal_serials=frozenset(), loaded=True, source="test-fleet.yaml"),
+        )
+        return proj_dir, mock_adapter
+
+    def test_outside_abs_and_relative_traversal_rejected_and_create_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """[contract] crucible_bvt(output_dir='/<tmp outside root>/x') and
+        output_dir='../out-rel' return a validation error and create nothing."""
+        from linc_crucible.core.state_paths import crucible_root
+
+        self._setup_ready_bvt_env(tmp_path, monkeypatch)
+        cwd_dir = tmp_path / "cwd"
+        cwd_dir.mkdir()
+        monkeypatch.chdir(cwd_dir)
+
+        outside_x = tmp_path / "outside" / "x"
+        rel_escape = "../out-rel"
+
+        for bad_out in (str(outside_x), rel_escape):
+            raw = asyncio.run(crucible_bvt(project="demo", device="DEV1", output_dir=bad_out))
+            _assert_validation_json(raw)
+
+        assert not outside_x.exists()
+        assert not outside_x.parent.exists()
+        assert not (tmp_path / "out-rel").exists()
+        assert not crucible_root().exists()
+
+    def test_root_itself_dot_and_internal_dotdot_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """[contract] '.' / root itself / '..' segments inside root return validation error."""
+        from linc_crucible.core.state_paths import crucible_root
+
+        self._setup_ready_bvt_env(tmp_path, monkeypatch)
+        root = crucible_root()
+
+        for bad_out in (
+            ".",
+            "./",
+            str(root),
+            "sub/../../escape",
+            str(root / "a" / ".." / "b"),
+            str(root / "a" / ".." / ".." / "escape"),
+        ):
+            raw = asyncio.run(crucible_bvt(project="demo", device="DEV1", output_dir=bad_out))
+            _assert_validation_json(raw)
+        assert not root.exists()
+
+    def test_symlinked_components_refused_and_create_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """[contract] Symlinked components (escaping, internal, broken, outside-to-inside)
+        are refused with a validation error and create nothing in target."""
+        from linc_crucible.core.state_paths import crucible_root
+
+        self._setup_ready_bvt_env(tmp_path, monkeypatch)
+        root = crucible_root()
+        root.mkdir(parents=True)
+
+        outside_dir = tmp_path / "outside_target"
+        outside_dir.mkdir()
+        real_sub = root / "real_sub"
+        real_sub.mkdir()
+
+        sym_out = root / "sym_out"
+        sym_out.symlink_to(outside_dir)
+
+        sym_in = root / "sym_in"
+        sym_in.symlink_to(real_sub)
+
+        sym_broken = root / "sym_broken"
+        sym_broken.symlink_to(root / "does_not_exist")
+
+        sym_self = root / "sym_self"
+        sym_self.symlink_to(root)
+
+        outside_link_in = tmp_path / "link_to_root"
+        outside_link_in.symlink_to(root)
+
+        for bad_out in (
+            str(sym_out),
+            str(sym_out / "nested"),
+            "sym_out/nested",
+            str(sym_self),
+            "sym_self",
+        ):
+            raw = asyncio.run(crucible_bvt(project="demo", device="DEV1", output_dir=bad_out))
+            _assert_validation_json(raw)
+            assert "must resolve inside crucible state root" in json.loads(raw)["error"]
+
+        for bad_out in (
+            str(sym_in),
+            str(sym_in / "nested"),
+            "sym_in/nested",
+            str(sym_broken),
+        ):
+            raw = asyncio.run(crucible_bvt(project="demo", device="DEV1", output_dir=bad_out))
+            _assert_validation_json(raw)
+            assert "must not traverse a symlink" in json.loads(raw)["error"]
+
+        raw_outside_in = asyncio.run(
+            crucible_bvt(project="demo", device="DEV1", output_dir=str(outside_link_in / "nested"))
+        )
+        _assert_validation_json(raw_outside_in)
+        assert "must be inside crucible state root" in json.loads(raw_outside_in)["error"]
+
+        assert list(outside_dir.iterdir()) == []
+        assert list(real_sub.iterdir()) == []
+        assert not (root / "nested").exists()
+
+    def test_valid_relative_and_contained_paths_accepted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """[contract] Valid relative and inside-root output_dir paths succeed under root."""
+        from linc_crucible.core.state_paths import crucible_root
+
+        self._setup_ready_bvt_env(tmp_path, monkeypatch)
+        root = crucible_root()
+
+        with patch("linc_crucible.core.bvt.runner.BVTRunner") as mock_runner_cls:
+            from linc_crucible.core.bvt.runner import BVTRunResult
+
+            mock_runner_cls.return_value.run_suite.return_value = BVTRunResult(
+                device="DEV1", package="com.example", tests=[]
+            )
+
+            out_rel = json.loads(
+                asyncio.run(crucible_bvt(project="demo", device="DEV1", output_dir="runs/r1"))
+            )
+            assert out_rel["ran"] is True
+            assert Path(out_rel["output_dir"]).resolve() == (root / "runs" / "r1").resolve()
+
+            abs_child = root / "runs" / "r2"
+            out_abs = json.loads(
+                asyncio.run(crucible_bvt(project="demo", device="DEV1", output_dir=str(abs_child)))
+            )
+            assert out_abs["ran"] is True
+            assert Path(out_abs["output_dir"]).resolve() == abs_child.resolve()
+
+    def test_symlinked_linc_home_parent_allows_contained_child(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Symlinked ancestor above crucible_root() (e.g. /tmp -> /private/tmp) still works."""
+        from linc_crucible.core.state_paths import crucible_root
+
+        real_home = tmp_path / "real_home"
+        real_home.mkdir()
+        sym_home = tmp_path / "sym_home"
+        sym_home.symlink_to(real_home)
+        monkeypatch.setenv("LINC_HOME", str(sym_home))
+        self._setup_ready_bvt_env(tmp_path, monkeypatch)
+
+        with patch("linc_crucible.core.bvt.runner.BVTRunner") as mock_runner_cls:
+            from linc_crucible.core.bvt.runner import BVTRunResult
+
+            mock_runner_cls.return_value.run_suite.return_value = BVTRunResult(
+                device="DEV1", package="com.example", tests=[]
+            )
+            res1 = json.loads(
+                asyncio.run(
+                    crucible_bvt(
+                        project="demo",
+                        device="DEV1",
+                        output_dir=str(crucible_root() / "c1"),
+                    )
+                )
+            )
+            assert res1["ran"] is True
+
+            res2 = json.loads(
+                asyncio.run(
+                    crucible_bvt(
+                        project="demo",
+                        device="DEV1",
+                        output_dir=str(crucible_root().resolve() / "c2"),
+                    )
+                )
+            )
+            assert res2["ran"] is True
+
+    def test_cli_bvt_outside_output_dir_exits_2(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """[contract] CLI `crucible bvt --output-dir` outside root exits 2 (validation)."""
+        self._setup_ready_bvt_env(tmp_path, monkeypatch)
+        outside = tmp_path / "outside" / "x"
+        res = CliRunner().invoke(
+            cli,
+            ["bvt", "--project", "demo", "--device", "DEV1", "--output-dir", str(outside)],
+        )
+        assert res.exit_code == 2, res.output
+        assert res.stdout == ""
+        envelope = json.loads(res.stderr)
+        assert envelope["error"]["category"] == "validation"
+        assert envelope["error"]["code"] == "VALIDATION_ERROR"
+        assert not outside.exists()
+
+    def test_symlink_raced_after_precheck_rejected_before_runner(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """[contract] A symlink introduced before _prepare_bvt_output_dir is rejected."""
+        from linc_crucible.core.state_paths import crucible_root
+
+        _, mock_adapter = self._setup_ready_bvt_env(tmp_path, monkeypatch)
+        root = crucible_root()
+        outside = tmp_path / "raced_outside"
+        outside.mkdir()
+
+        def _race_symlink() -> list[dict[str, str]]:
+            root.mkdir(parents=True, exist_ok=True)
+            (root / "raced").symlink_to(outside)
+            return [{"serial": "DEV1", "platform": "android"}]
+
+        mock_adapter.discover.side_effect = _race_symlink
+        raw = asyncio.run(crucible_bvt(project="demo", device="DEV1", output_dir="raced"))
+        _assert_validation_json(raw)
+        assert list(outside.iterdir()) == []
+
+    def test_prepare_bvt_output_dir_rechecks_after_ensure_private_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """[contract] _prepare_bvt_output_dir re-proves containment after mkdir."""
+        from linc_crucible import bvt_tools
+        from linc_crucible.core.state_paths import crucible_root
+        from linc_crucible.core.tool_args import InvalidToolArg
+
+        root = crucible_root()
+        outside = tmp_path / "raced_during_mkdir"
+        outside.mkdir()
+
+        def _symlink_during_mkdir(path: Path) -> Path:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.symlink_to(outside)
+            return path
+
+        monkeypatch.setattr(bvt_tools, "ensure_private_dir", _symlink_during_mkdir)
+        with pytest.raises(InvalidToolArg, match="must resolve inside crucible state root"):
+            bvt_tools._prepare_bvt_output_dir("raced_mkdir")
+        assert (root / "raced_mkdir").is_symlink()
+
+    def test_output_dir_max_path_length_boundary(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """output_dir honors MAX_PATH_LEN (1024 accepted, 1025 and >NAME_MAX segment rejected)."""
+        from linc_crucible.core.state_paths import crucible_root
+        from linc_crucible.core.tool_args import check_bvt_output_dir
+
+        valid_1024 = "a/" + ("./" * 510) + "bb"
+        assert len(valid_1024) == 1024
+        assert check_bvt_output_dir(valid_1024) == valid_1024
+        with pytest.raises(InvalidToolArg, match="at most 1024"):
+            check_bvt_output_dir(valid_1024 + "c")
+        crucible_root().mkdir(parents=True)
+        with pytest.raises(InvalidToolArg, match="invalid path component"):
+            check_bvt_output_dir("a" * 300)
+
+    def test_output_dir_none_uses_temp_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Omitting output_dir uses the default mkdtemp directory."""
+        import shutil
+
+        self._setup_ready_bvt_env(tmp_path, monkeypatch)
+        with patch("linc_crucible.core.bvt.runner.BVTRunner") as mock_runner_cls:
+            from linc_crucible.core.bvt.runner import BVTRunResult
+
+            mock_runner_cls.return_value.run_suite.return_value = BVTRunResult(
+                device="DEV1", package="com.example", tests=[]
+            )
+            res = json.loads(asyncio.run(crucible_bvt(project="demo", device="DEV1")))
+        assert res["ran"] is True
+        out_path = Path(res["output_dir"])
+        assert out_path.name.startswith("crucible_bvt_")
+        shutil.rmtree(out_path, ignore_errors=True)
+
+    def test_existing_file_and_child_output_dir_return_validation_error_and_create_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """[contract] output_dir naming an existing file under the root, and <file>/sub,
+        return validation_error and create nothing; OSError in _prepare_bvt_output_dir maps
+        to InvalidToolArg."""
+        from linc_crucible import bvt_tools
+        from linc_crucible.core.state_paths import crucible_root
+
+        self._setup_ready_bvt_env(tmp_path, monkeypatch)
+        root = crucible_root()
+        root.mkdir(parents=True)
+        existing_file = root / "not_a_dir.txt"
+        existing_file.write_text("keep", encoding="utf-8")
+
+        raw_file = asyncio.run(
+            crucible_bvt(project="demo", device="DEV1", output_dir="not_a_dir.txt")
+        )
+        _assert_validation_json(raw_file)
+        assert json.loads(raw_file)["error"] == (
+            "invalid output_dir: must be a directory (got 'not_a_dir.txt')"
+        )
+
+        raw_child = asyncio.run(
+            crucible_bvt(project="demo", device="DEV1", output_dir="not_a_dir.txt/sub")
+        )
+        _assert_validation_json(raw_child)
+        assert json.loads(raw_child)["error"] == (
+            "invalid output_dir: cannot create output directory (NotADirectoryError) "
+            "(got 'not_a_dir.txt/sub')"
+        )
+
+        assert existing_file.read_text(encoding="utf-8") == "keep"
+        assert list(root.iterdir()) == [existing_file]
+
+        for exc_cls in (NotADirectoryError, FileExistsError, PermissionError):
+
+            def _raise_os_err(_path: Path, _cls: type[OSError] = exc_cls) -> Path:
+                raise _cls("boom")
+
+            monkeypatch.setattr(bvt_tools, "ensure_private_dir", _raise_os_err)
+            with pytest.raises(InvalidToolArg) as exc:
+                bvt_tools._prepare_bvt_output_dir("err_case")
+            assert exc.value.field == "output_dir"
+            assert exc.value.reason == f"cannot create output directory ({exc_cls.__name__})"
+            assert "'err_case'" in str(exc.value)
+
+    def test_preplanted_bvt_screenshots_symlink_yields_validation_error_and_writes_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """[contract] a pre-planted bvt_screenshots -> <outside> symlink inside the output dir
+        yields a validation error and no file outside the root."""
+        from linc_crucible.core.state_paths import crucible_root
+
+        proj_dir, mock_adapter = self._setup_ready_bvt_env(tmp_path, monkeypatch)
+        (proj_dir / ".bvt" / "smoke.yaml").write_text(
+            "package: com.example\ntests:\n  - name: t1\n    steps:\n      - screenshot: snap\n",
+            encoding="utf-8",
+        )
+        mock_adapter.screenshot.return_value = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+
+        root = crucible_root()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+
+        out_escape = root / "preplanted_escape"
+        out_escape.mkdir(parents=True)
+        (out_escape / "bvt_screenshots").symlink_to(outside, target_is_directory=True)
+
+        raw = asyncio.run(
+            crucible_bvt(project="demo", device="DEV1", output_dir="preplanted_escape")
+        )
+        _assert_validation_json(raw)
+        assert "bvt_screenshots must resolve inside output_dir" in json.loads(raw)["error"]
+        assert list(outside.iterdir()) == []
+        assert mock_adapter.screenshot.call_count == 0
+        assert mock_adapter.ensure_ready.call_count == 0
+
+
+@pytest.mark.parametrize(
+    ("value", "reason"),
+    [
+        ("", "must not be empty"),
+        ("a/../b", "must not contain '..' segments"),
+        ("/definitely-outside-crucible-root/x", "must be inside crucible state root"),
+    ],
+)
+def test_contract_resolve_bvt_output_dir_rejection_names_field_reason_and_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str, reason: str
+) -> None:
+    """[contract] each output_dir rejection names the field, the exact reason and the
+    offending value, so a caller can tell which rule fired."""
+    from linc_crucible.core.tool_args import InvalidToolArg, resolve_bvt_output_dir
+
+    monkeypatch.setenv("LINC_HOME", str(tmp_path / "home"))
+    with pytest.raises(InvalidToolArg) as exc:
+        resolve_bvt_output_dir(value)
+    assert exc.value.field == "output_dir"
+    assert exc.value.reason == reason
+    assert str(exc.value).startswith(f"invalid output_dir: {reason} (got ")
+    if value:
+        assert value in str(exc.value)
+    with pytest.raises(InvalidToolArg) as custom:
+        resolve_bvt_output_dir(value, field="dest")
+    assert custom.value.field == "dest"
+
+
+def test_contract_resolve_bvt_output_dir_symlink_and_unreadable_component_reasons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[contract] a symlinked component and an unreadable component each fail with their
+    own reason, field and value."""
+    from linc_crucible.core.state_paths import crucible_root
+    from linc_crucible.core.tool_args import InvalidToolArg, resolve_bvt_output_dir
+
+    monkeypatch.setenv("LINC_HOME", str(tmp_path / "home"))
+    root = crucible_root()
+    root.mkdir(parents=True)
+    inside = root / "real"
+    inside.mkdir()
+    (root / "link").symlink_to(inside, target_is_directory=True)
+
+    with pytest.raises(InvalidToolArg) as linked:
+        resolve_bvt_output_dir("link/x")
+    assert (linked.value.field, linked.value.reason) == (
+        "output_dir",
+        "must not traverse a symlink",
+    )
+    assert "link/x" in str(linked.value)
+
+    real_is_symlink = Path.is_symlink
+
+    def _boom(self: Path) -> bool:
+        if self.name == "unreadable":
+            raise OSError("denied")
+        return real_is_symlink(self)
+
+    monkeypatch.setattr(Path, "is_symlink", _boom)
+    with pytest.raises(InvalidToolArg) as unreadable:
+        resolve_bvt_output_dir("unreadable/x")
+    assert (unreadable.value.field, unreadable.value.reason) == (
+        "output_dir",
+        "invalid path component",
+    )
+    assert "unreadable/x" in str(unreadable.value)
+
+
+def test_contract_resolve_bvt_output_dir_root_and_resolve_escape_reasons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[contract] the root itself and a path that resolves outside the root each fail with
+    their own reason, field and value; check_bvt_output_dir forwards its field name."""
+    from linc_crucible.core.state_paths import crucible_root
+    from linc_crucible.core.tool_args import (
+        InvalidToolArg,
+        check_bvt_output_dir,
+        resolve_bvt_output_dir,
+    )
+
+    monkeypatch.setenv("LINC_HOME", str(tmp_path / "home"))
+    root = crucible_root()
+    root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "escape").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(InvalidToolArg) as at_root:
+        resolve_bvt_output_dir(".")
+    assert (at_root.value.field, at_root.value.reason) == (
+        "output_dir",
+        "must be a subdirectory inside crucible state root",
+    )
+    assert str(at_root.value).endswith("(got '.')")
+
+    with pytest.raises(InvalidToolArg) as escaped:
+        resolve_bvt_output_dir("escape/x")
+    assert (escaped.value.field, escaped.value.reason) == (
+        "output_dir",
+        "must resolve inside crucible state root",
+    )
+    assert "escape/x" in str(escaped.value)
+
+    assert check_bvt_output_dir(None) is None
+    assert check_bvt_output_dir("runs/a") == "runs/a"
+    with pytest.raises(InvalidToolArg) as default_field:
+        check_bvt_output_dir("")
+    assert default_field.value.field == "output_dir"
+    with pytest.raises(InvalidToolArg) as custom_field:
+        check_bvt_output_dir("", field="dest")
+    assert custom_field.value.field == "dest"

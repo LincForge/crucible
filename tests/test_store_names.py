@@ -56,23 +56,12 @@ HOSTILE_NAMES: list[object] = [
 VALID_NAMES = ["myapp", "My.App_2-x", "home", "default", "a", "A" * MAX_NAME_LEN]
 
 
-def ascii_id(value: object) -> str:
-    """An ASCII-only, escape-free test id for a hostile parameter.
-
-    mutmut re-selects tests by node id, and pytest cannot find an id that holds an escape
-    sequence or non-ASCII text (`'a\\x00b'`, `'caf\\xe9'`), so pr-diff-mutation died with
-    an instrument error (exit 4, "not found"). pytest dedupes collisions with a suffix.
-    """
-    text = repr(value).encode("ascii", "backslashreplace").decode("ascii")
-    return "".join(c if c.isalnum() or c in "._-" else "_" for c in text)[:40] or "_"
-
-
 def _listing(root: Path) -> list[tuple[str, list[str], list[str]]]:
     return [(d, sorted(ds), sorted(fs)) for d, ds, fs in os.walk(root)]
 
 
 class TestValidateName:
-    @pytest.mark.parametrize("value", HOSTILE_NAMES, ids=ascii_id)
+    @pytest.mark.parametrize("value", HOSTILE_NAMES)
     def test_contract_hostile_name_rejected(self, value: object) -> None:
         """[contract] every hostile name in the R4 table raises InvalidStoreName."""
         with pytest.raises(InvalidStoreName) as excinfo:
@@ -108,7 +97,6 @@ class TestValidateName:
             (5, "must be a string"),
             (None, "must be a string"),
         ],
-        ids=ascii_id,
     )
     def test_error_names_the_rule(self, value: object, rule: str) -> None:
         with pytest.raises(InvalidStoreName) as excinfo:
